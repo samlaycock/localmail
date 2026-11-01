@@ -1,0 +1,12 @@
+# Copy to ./localmail.toml (picked up automatically) or pass --config <path>.
+# Every setting is optional; CLI flags and LOCALMAIL_* env vars take precedence.
+
+# host = "127.0.0.1"              # use "0.0.0.0" in Docker
+# port = 9402                     # web UI, dev API and the provider APIs
+# smtp_port = 2525
+# base_url = "http://localhost:9402"   # for links and the setup page's snippets
+# data_dir = "~/.localmail"       # where messages are kept (messages.db)
+# in_memory = false               # start with an empty inbox every time
+# max_messages = 5000             # the oldest are deleted beyond this
+# max_message_size = 41943040     # bytes (40 MB), over SMTP and the APIs
+# scenario_domain = "localmail.test"   # reject@<domain>, ratelimit@<domain>, ...

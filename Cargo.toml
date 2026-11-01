@@ -1,0 +1,38 @@
+[package]
+name = "localmail"
+version = "0.0.0"
+edition = "2024"
+description = "A local SMTP server and email API emulator (SES, SendGrid, Postmark, Resend) for offline development and testing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/samlaycock/localmail"
+readme = "README.md"
+keywords = ["email", "smtp", "testing", "emulator", "sendgrid"]
+categories = ["development-tools::testing", "email"]
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.23"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+mail-builder = "2"
+mail-parser = "1"
+rand = "0.8"
+regex = "1"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.1.8"
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+uuid = { version = "1.29.0", features = ["v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }
+
+[profile.release]
+strip = "symbols"
