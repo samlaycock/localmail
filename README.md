@@ -208,7 +208,7 @@ http://localhost:9402 shows messages as they arrive, newest first.
 - **Mailboxes.** The sidebar lists every address that has received mail, with its unread count, most recent first. Pick one to see just that address's mail (sent To, Cc or Bcc), or filter the list to find an address.
   - A mailbox has its own link, `http://localhost:9402/?to=alice@example.com`, which works even before any mail arrives; the mail appears as soon as it does.
   - Click any recipient of an open message to go to their mailbox.
-  - **Mark all read** and **Delete all** apply to the open mailbox only. Deleting a mailbox's mail deletes those messages for every recipient.
+  - **Mark all read** and **Delete all** apply to the messages listed: the open mailbox, narrowed by any search or provider filter. The confirmation says how many will go. Deleting a message deletes it for every recipient.
 - Search by subject, sender or recipient, or filter by provider.
 - Use `j` and `k` to move through the list.
 - Each message shows its HTML (in a sandboxed frame with no scripts, links opening in a new tab), text, headers, MIME source, attachments and the request your app sent to the API.
