@@ -187,23 +187,28 @@ Codes and links are searched in the subject, the text body, the HTML and, for [t
 | Endpoint | |
 |---|---|
 | `GET /dev/api/cursor` | `{"cursor": <newest id>}` |
-| `GET /dev/api/messages` | Matching messages, newest first: `{messages, total, unread, cursor}`. Accepts the filters plus `limit` (default 50) and `offset`. |
+| `GET /dev/api/messages` | Matching messages, newest first: `{messages, total, unread, cursor}`, where `unread` counts the matching messages. Accepts the filters plus `limit` (default 50) and `offset`. |
+| `GET /dev/api/mailboxes` | Every address that has received mail (To, Cc or Bcc), most recent first, with its `total` and `unread` messages and `last_received_at`. Accepts `q` (part of the address) and `limit` (default 200). |
 | `DELETE /dev/api/messages` | Delete matching messages (all of them without filters): `{"deleted": n}` |
 | `GET /dev/api/messages/{id}` | Everything about a message: addresses, headers, text, HTML, attachments, provider details, the original request and, for SMTP, the envelope. `latest` is the newest (matching the filters). |
 | `DELETE /dev/api/messages/{id}` | Delete one |
 | `GET /dev/api/messages/{id}/raw` | The MIME source (`?download` for an `.eml` file) |
 | `GET /dev/api/messages/{id}/html` | The HTML body, sandboxed, with `cid:` images resolved |
 | `GET /dev/api/messages/{id}/attachments/{n}` | An attachment (`?download` to save it) |
-| `POST /dev/api/messages/{id}/read`, `POST /dev/api/messages/read` | Mark one (body `{"read": false}` to unmark) or all as read |
+| `POST /dev/api/messages/{id}/read`, `POST /dev/api/messages/read` | Mark one, or every matching message (all of them without filters), as read. Send the body `{"read": false}` to mark them unread. |
 | `GET`, `DELETE /dev/api/attempts` | The [attempts log](#attempts) |
 | `GET /dev/api/scenarios`, `POST /dev/api/scenarios/reset` | Scenario addresses, flaky counters |
 
-**Isolating tests.** Give each test its own recipient, e.g. `alice-<uuid>@example.com`, and filter on it. Parallel workers then never see each other's mail, and nothing needs clearing between tests. `DELETE /dev/api/messages?to=…` tidies up one test's messages.
+**Isolating tests.** Give each test its own recipient, e.g. `alice-<uuid>@example.com`, and filter on it. Parallel workers then never see each other's mail, and nothing needs clearing between tests. `DELETE /dev/api/messages?to=…` tidies up one test's messages, and printing `http://localhost:9402/?to=<address>` when a test fails links straight to its [mailbox](#the-inbox).
 
 ## The inbox
 
 http://localhost:9402 shows messages as they arrive, newest first.
 
+- **Mailboxes.** The sidebar lists every address that has received mail, with its unread count, most recent first. Pick one to see just that address's mail (sent To, Cc or Bcc), or filter the list to find an address.
+  - A mailbox has its own link, `http://localhost:9402/?to=alice@example.com`, which works even before any mail arrives; the mail appears as soon as it does.
+  - Click any recipient of an open message to go to their mailbox.
+  - **Mark all read** and **Delete all** apply to the open mailbox only. Deleting a mailbox's mail deletes those messages for every recipient.
 - Search by subject, sender or recipient, or filter by provider.
 - Use `j` and `k` to move through the list.
 - Each message shows its HTML (in a sandboxed frame with no scripts, links opening in a new tab), text, headers, MIME source, attachments and the request your app sent to the API.
