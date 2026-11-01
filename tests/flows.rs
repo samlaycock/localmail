@@ -829,3 +829,28 @@ async fn smtp_conversation() {
     assert_eq!(smtp_attempts[3]["status"], 550);
     assert!(smtp_attempts[0]["request"].as_str().unwrap().contains("RCPT TO:<flaky-1@localmail.test>"));
 }
+
+#[tokio::test]
+async fn legacy_charsets_are_decoded() {
+    let (app, _) = app();
+    // 日本語 in ISO-2022-JP, in the subject (an encoded word) and the body.
+    let jp = b"\x1b$BF|K\\8l\x1b(B";
+    let mut raw = format!(
+        "From: a@acme.test\r\nTo: jp@example.com\r\nSubject: =?ISO-2022-JP?B?{}?=\r\nContent-Type: text/plain; charset=ISO-2022-JP\r\n\r\n",
+        b64_std(jp)
+    )
+    .into_bytes();
+    raw.extend_from_slice(jp);
+    let r = call(
+        &app,
+        Method::POST,
+        "/",
+        &[AWS, ("content-type", "application/x-www-form-urlencoded")],
+        form(&[("Action", "SendRawEmail"), ("RawMessage.Data", &b64_std(&raw))]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let m = latest(&app, "jp@example.com").await;
+    assert_eq!(m["subject"], "日本語");
+    assert_eq!(m["text"], "日本語");
+}

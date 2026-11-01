@@ -15,7 +15,7 @@ axum = { version = "0.8", features = ["macros"] }
 base64 = "0.23"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 mail-builder = "2"
-mail-parser = "1"
+mail-parser = { version = "1", features = ["full_encoding"] }
 rand = "0.8"
 regex = "1"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
