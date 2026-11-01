@@ -1,5 +1,11 @@
 # localmail
 
+## 0.2.0
+
+### Minor Changes
+
+- [#2](https://github.com/samlaycock/localmail/pull/2) [`bba22b9`](https://github.com/samlaycock/localmail/commit/bba22b989f2a5fa78abc40d74d4a36fb46870446) Thanks [@samlaycock](https://github.com/samlaycock)! - Mailboxes: the inbox lists every address that has received mail, with unread counts, and shows one address's mail (To, Cc or Bcc) at its own link, `/?to=<address>`. Recipients of an open message link to their mailboxes, and Mark all read and Delete all apply to the messages listed (the open mailbox, narrowed by any search or provider filter). The dev API adds `GET /dev/api/mailboxes`; `POST /dev/api/messages/read` accepts the message filters; and the `unread` count from `GET /dev/api/messages` now counts the matching messages rather than the whole inbox.
+
 ## 0.1.0
 
 ### Minor Changes
