@@ -31,7 +31,13 @@ pub async fn inbox(State(state): State<AppState>) -> Response {
     let data = json!({ "providers": providers_json(), "smtp": smtp_address(&state), "base": state.config.base_url });
     let body = format!(
         r#"<div class="inbox" id="lm-inbox">
+  <nav class="mailbox-pane" aria-label="Mailboxes">
+    <div class="mailbox-title">Mailboxes</div>
+    <input id="lm-mbox-filter" type="search" placeholder="Filter addresses" aria-label="Filter mailboxes">
+    <ul class="mailboxes" id="lm-mailboxes"></ul>
+  </nav>
   <section class="list-pane">
+    <div class="mailbox-head" id="lm-mailbox-head" hidden></div>
     <div class="list-toolbar">
       <input id="lm-search" type="search" placeholder="Search" aria-label="Search messages">
       <select id="lm-provider" aria-label="Filter by provider"><option value="">All</option></select>

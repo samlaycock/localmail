@@ -659,7 +659,9 @@ async fn list_filter_read_and_delete() {
     let r = get(&app, "/dev/api/messages?to=a@example.com").await.json();
     assert_eq!(r["total"], 2);
     assert_eq!(r["messages"][0]["subject"], "Gamma");
-    assert_eq!(r["unread"], 3);
+    // Unread among the matching messages.
+    assert_eq!(r["unread"], 2);
+    assert_eq!(get(&app, "/dev/api/messages").await.json()["unread"], 3);
     assert_eq!(get(&app, "/dev/api/messages?q=bet").await.json()["total"], 1);
     assert_eq!(get(&app, "/dev/api/messages?provider=resend&subject=alpha").await.json()["total"], 1);
     assert_eq!(get(&app, "/dev/api/messages?provider=mailchimp").await.status, StatusCode::BAD_REQUEST);
@@ -853,4 +855,65 @@ async fn legacy_charsets_are_decoded() {
     let m = latest(&app, "jp@example.com").await;
     assert_eq!(m["subject"], "日本語");
     assert_eq!(m["text"], "日本語");
+}
+
+#[tokio::test]
+async fn mailboxes_list_each_recipient_with_counts() {
+    let (app, _) = app();
+    resend(&app, "alice@example.com", "One", "x").await;
+    resend(&app, "Alice@Example.com", "Two", "x").await;
+    resend(&app, "bob@example.com", "Three", "x").await;
+    // Alice twice on one message (To and Bcc) still counts it once.
+    let r = post_json(
+        &app,
+        "/emails",
+        &[RS],
+        json!({ "from": "app@acme.test", "to": ["carol@example.com", "alice@example.com"], "bcc": "alice@example.com", "subject": "Four", "text": "x" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+
+    let r = get(&app, "/dev/api/mailboxes").await.json();
+    let boxes: Vec<(String, u64, u64)> = r["mailboxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            (b["address"].as_str().unwrap().to_string(), b["total"].as_u64().unwrap(), b["unread"].as_u64().unwrap())
+        })
+        .collect();
+    // Most recent mail first; addresses are matched case-insensitively.
+    assert_eq!(
+        boxes,
+        vec![("alice@example.com".into(), 3, 3), ("carol@example.com".into(), 1, 1), ("bob@example.com".into(), 1, 1)]
+    );
+    assert_eq!((r["total"].as_u64(), r["messages"].as_u64(), r["unread"].as_u64()), (Some(3), Some(4), Some(4)));
+
+    // Mark one mailbox read: only its messages change, and the list's unread count follows the filter.
+    let r = call(&app, Method::POST, "/dev/api/messages/read?to=alice@example.com", &[], Body::empty()).await;
+    assert_eq!(r.json()["updated"], 3);
+    assert_eq!(get(&app, "/dev/api/messages?to=alice@example.com").await.json()["unread"], 0);
+    assert_eq!(get(&app, "/dev/api/messages?to=bob@example.com").await.json()["unread"], 1);
+    let r = get(&app, "/dev/api/mailboxes").await.json();
+    assert_eq!(r["unread"], 1);
+    assert_eq!(r["mailboxes"][1]["unread"], 0, "carol's message was Alice's too");
+
+    // And back to unread.
+    let r = call(
+        &app,
+        Method::POST,
+        "/dev/api/messages/read?to=bob@example.com",
+        &[("content-type", "application/json")],
+        json!({ "read": false }).to_string(),
+    )
+    .await;
+    assert_eq!(r.json()["updated"], 1);
+
+    // Filtering and limits.
+    let r = get(&app, "/dev/api/mailboxes?q=ALI").await.json();
+    assert_eq!(r["mailboxes"].as_array().unwrap().len(), 1);
+    let r = get(&app, "/dev/api/mailboxes?limit=1").await.json();
+    assert_eq!((r["mailboxes"].as_array().unwrap().len(), r["total"].as_u64()), (1, Some(3)));
+    assert_eq!(get(&app, "/dev/api/mailboxes?to=x").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(get(&app, "/dev/api/mailboxes?q=100%25_").await.json()["total"], 0);
 }

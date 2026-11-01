@@ -24,6 +24,7 @@ use crate::store::Filter;
 pub const MAX_WAIT_SECS: i64 = 300;
 const DEFAULT_WAIT_SECS: i64 = 30;
 const DEFAULT_LIMIT: usize = 50;
+const DEFAULT_MAILBOXES: usize = 200;
 const MAX_LIMIT: usize = 1000;
 
 fn no_store() -> [(header::HeaderName, &'static str); 1] {
@@ -134,7 +135,8 @@ pub async fn list(State(state): State<AppState>, Query(q): Query<HashMap<String,
     let body = json!({
         "messages": state.store.list(&filter, limit, offset),
         "total": state.store.count(&filter),
-        "unread": state.store.unread(),
+        // Unread among the matching messages.
+        "unread": state.store.unread(&filter),
         "cursor": state.store.cursor(),
     });
     (no_store(), Json(body)).into_response()
@@ -257,15 +259,49 @@ pub async fn mark_read(
 ) -> Response {
     let read = body.and_then(|b| b.0.read).unwrap_or(true);
     match id.parse::<i64>() {
-        Ok(n) if state.store.set_read(Some(n), read) > 0 => StatusCode::NO_CONTENT.into_response(),
+        Ok(n) if state.store.set_read(n, read) > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => not_found(&id),
         Err(_) => invalid("message ids are numbers"),
     }
 }
 
-pub async fn mark_all_read(State(state): State<AppState>) -> Response {
-    let n = state.store.set_read(None, true);
+/// Mark every matching message (all of them without filters) read, or unread with `{"read": false}`.
+pub async fn mark_all_read(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Option<Json<ReadRequest>>,
+) -> Response {
+    let filter = match Params::check(q, &[&FILTER_KEYS]).and_then(|p| p.filter()) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let read = body.and_then(|b| b.0.read).unwrap_or(true);
+    let n = state.store.set_read_matching(&filter, read);
     (no_store(), Json(json!({ "updated": n }))).into_response()
+}
+
+/// Every address that has received mail, most recent first, with message and unread counts.
+pub async fn mailboxes(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let params = match Params::check(q, &[&["q", "limit"]]) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let limit = match params.usize("limit", DEFAULT_MAILBOXES, MAX_LIMIT) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    let (mailboxes, matching) = state.store.mailboxes(params.get("q"), limit);
+    let all = Filter::default();
+    let body = json!({
+        "mailboxes": mailboxes,
+        // Addresses matching `q` (the list may be cut short by `limit`).
+        "total": matching,
+        // Across the whole inbox, for "All mail".
+        "messages": state.store.count(&all),
+        "unread": state.store.unread(&all),
+        "cursor": state.store.cursor(),
+    });
+    (no_store(), Json(body)).into_response()
 }
 
 pub async fn extract_handler(

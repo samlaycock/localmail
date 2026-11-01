@@ -17,6 +17,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/app.js", get(pages::js))
         .route("/health", get(|| async { "ok" }))
         .route("/dev/api/cursor", get(api::cursor))
+        .route("/dev/api/mailboxes", get(api::mailboxes))
         .route("/dev/api/messages", get(api::list).delete(api::delete_matching))
         .route("/dev/api/messages/wait", get(api::wait))
         .route("/dev/api/messages/read", post(api::mark_all_read))

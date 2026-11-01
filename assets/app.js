@@ -77,33 +77,93 @@ function providerChip(id) {
   const search = document.getElementById('lm-search');
   const providerSel = document.getElementById('lm-provider');
   const count = document.getElementById('lm-count');
+  const mailboxList = document.getElementById('lm-mailboxes');
+  const mailboxFilter = document.getElementById('lm-mbox-filter');
+  const mailboxHead = document.getElementById('lm-mailbox-head');
   for (const p of data.providers) providerSel.append(h('option', { value: p.id }, p.name));
 
-  const state = { messages: [], selected: null, cursor: 0, tab: 'html' };
+  // `mailbox`: the recipient address being shown (`?to=` in the URL), or null for all mail.
+  const state = { messages: [], selected: null, cursor: 0, tab: 'html', mailbox: null };
+  const mailboxFromUrl = () => new URLSearchParams(location.search).get('to')?.trim().toLowerCase() || null;
+  const mailboxUrl = (address) => (address ? `/?to=${encodeURIComponent(address)}` : '/');
+  state.mailbox = mailboxFromUrl();
+
+  /** Show one address's mail (or all mail with null). */
+  function setMailbox(address) {
+    address = address ? address.trim().toLowerCase() : null;
+    if (address === state.mailbox) return;
+    state.mailbox = address;
+    history.pushState(null, '', mailboxUrl(address));
+    state.selected = null;
+    empty();
+    load();
+  }
+
+  /** A link to an address's mailbox that opens it in place (and still works in a new tab). */
+  const mailboxLink = (address, label, cls = 'addr-link') => h('a', {
+    class: cls, href: mailboxUrl(address), title: `Mail to ${address}`,
+    onclick: (e) => { if (e.metaKey || e.ctrlKey || e.shiftKey || e.button) return; e.preventDefault(); setMailbox(address); },
+  }, label);
 
   const selectedId = () => {
     const m = location.hash.match(/^#\/m\/(\d+)/);
     return m ? Number(m[1]) : null;
   };
 
+  /** The current mailbox as API filters. */
+  const scope = () => (state.mailbox ? { to: state.mailbox } : {});
+
   async function load() {
-    const q = new URLSearchParams({ limit: '300' });
+    const q = new URLSearchParams({ limit: '300', ...scope() });
     if (search.value.trim()) q.set('q', search.value.trim());
     if (providerSel.value) q.set('provider', providerSel.value);
-    const res = await api(`/dev/api/messages?${q}`);
+    const mq = new URLSearchParams({ limit: '200' });
+    if (mailboxFilter.value.trim()) mq.set('q', mailboxFilter.value.trim());
+    const [res, boxes] = await Promise.all([api(`/dev/api/messages?${q}`), api(`/dev/api/mailboxes?${mq}`)]);
     state.messages = res.messages;
     state.cursor = res.cursor;
     const filtered = search.value.trim() || providerSel.value;
     count.textContent = filtered ? `${res.total} matching` : `${res.total} message${res.total === 1 ? '' : 's'}, ${res.unread} unread`;
-    document.title = `${res.unread ? `(${res.unread}) ` : ''}Inbox · localmail`;
+    document.title = `${boxes.unread ? `(${boxes.unread}) ` : ''}${state.mailbox || 'Inbox'} · localmail`;
+    renderMailboxes(boxes);
     renderList();
+  }
+
+  function renderMailboxes(boxes) {
+    const item = (address, label, total, unread) => h('li', {},
+      mailboxLink(address, [h('span', { class: 'mbox-name' }, label),
+        unread ? h('span', { class: 'mbox-unread', title: `${unread} unread` }, String(unread)) : h('span', { class: 'mbox-total', title: `${total} messages` }, String(total))],
+      `mbox${(address || null) === state.mailbox ? ' current' : ''}`));
+    const items = [item(null, 'All mail', boxes.messages, boxes.unread)];
+    // The open mailbox stays listed even if the filter (or the limit) would hide it.
+    if (state.mailbox && !boxes.mailboxes.some((b) => b.address === state.mailbox)) items.push(item(state.mailbox, state.mailbox, 0, 0));
+    for (const b of boxes.mailboxes) items.push(item(b.address, b.address, b.total, b.unread));
+    if (boxes.total > boxes.mailboxes.length) {
+      items.push(h('li', { class: 'mbox-more muted small' }, `Showing ${boxes.mailboxes.length} of ${boxes.total}. Filter to find others.`));
+    } else if (!boxes.mailboxes.length && mailboxFilter.value.trim()) {
+      items.push(h('li', { class: 'mbox-more muted small' }, 'No addresses match.'));
+    }
+    mailboxList.replaceChildren(...items);
+
+    if (state.mailbox) {
+      const link = location.origin + mailboxUrl(state.mailbox);
+      mailboxHead.replaceChildren(
+        h('div', { class: 'mailbox-current' }, h('span', { class: 'muted small' }, 'Mail to'), h('b', {}, state.mailbox)),
+        copyBtn(link, 'Copy link'),
+        h('button', { type: 'button', class: 'btn small ghost', title: 'Show all mail', onclick: () => setMailbox(null) }, 'All mail'));
+      mailboxHead.hidden = false;
+    } else {
+      mailboxHead.hidden = true;
+    }
   }
 
   function renderList() {
     list.replaceChildren();
     if (!state.messages.length) {
       const filtered = search.value.trim() || providerSel.value;
-      list.append(h('li', { class: 'empty' }, filtered ? 'No messages match.' : [
+      list.append(h('li', { class: 'empty' }, filtered ? 'No messages match.' : state.mailbox ? [
+        'No mail to ', h('code', {}, state.mailbox), ' yet. It will appear here as soon as it arrives.',
+      ] : [
         'No messages yet. Send over SMTP to ', h('code', {}, data.smtp), ' or call a provider API at ', h('code', {}, data.base),
         '. ', h('a', { href: '/setup' }, 'Setup'), ' shows how.',
       ]));
@@ -171,9 +231,11 @@ function providerChip(id) {
   }
 
   function renderMessage(m) {
-    const rows = [['From', addr(m.from)], ['To', m.to.map(addr).join(', ')], ['Cc', m.cc.map(addr).join(', ')],
-      ['Bcc', m.bcc.map(addr).join(', ')], ['Reply-To', m.reply_to.map(addr).join(', ')], ['Date', fullTime(m.received_at)]]
-      .filter(([, v]) => v);
+    // Recipients link to their mailboxes.
+    const recipients = (list) => list.flatMap((a, i) => [i ? ', ' : '', mailboxLink(a.email, addr(a))]);
+    const rows = [['From', addr(m.from)], ['To', recipients(m.to)], ['Cc', recipients(m.cc)],
+      ['Bcc', recipients(m.bcc)], ['Reply-To', m.reply_to.map(addr).join(', ')], ['Date', fullTime(m.received_at)]]
+      .filter(([, v]) => v.length);
     const head = h('div', { class: 'view-head' },
       h('div', { class: 'view-title' },
         h('h1', {}, m.subject || (m.template ? `(template ${m.template.id})` : '(no subject)')),
@@ -304,10 +366,16 @@ function providerChip(id) {
   let timer;
   search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 200); });
   providerSel.addEventListener('change', load);
-  document.getElementById('lm-read-all').addEventListener('click', async () => { await api('/dev/api/messages/read', { method: 'POST' }); load(); });
+  let mboxTimer;
+  mailboxFilter.addEventListener('input', () => { clearTimeout(mboxTimer); mboxTimer = setTimeout(load, 200); });
+  // Bulk actions apply to the open mailbox only.
+  document.getElementById('lm-read-all').addEventListener('click', async () => {
+    await api(`/dev/api/messages/read?${new URLSearchParams(scope())}`, { method: 'POST' });
+    load();
+  });
   document.getElementById('lm-delete-all').addEventListener('click', async () => {
-    if (!confirm('Delete every message?')) return;
-    await api('/dev/api/messages', { method: 'DELETE' });
+    if (!confirm(state.mailbox ? `Delete every message to ${state.mailbox}?` : 'Delete every message?')) return;
+    await api(`/dev/api/messages?${new URLSearchParams(scope())}`, { method: 'DELETE' });
     location.hash = '';
     empty();
     load();
@@ -318,6 +386,13 @@ function providerChip(id) {
     if (e.key === 'k') step(-1);
   });
   window.addEventListener('hashchange', () => { const id = selectedId(); if (id) show(id); else empty(); });
+  // Back and forward between mailboxes.
+  window.addEventListener('popstate', () => {
+    const mailbox = mailboxFromUrl();
+    if (mailbox === state.mailbox) return;
+    state.mailbox = mailbox;
+    load().then(() => { const id = selectedId(); if (id) show(id); else empty(); });
+  });
 
   load().then(() => {
     const id = selectedId();

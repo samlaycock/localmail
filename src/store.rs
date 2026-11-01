@@ -20,6 +20,16 @@ pub struct Store {
     latest: watch::Sender<i64>,
 }
 
+/// An address that has received mail, for the inbox's mailbox list.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Mailbox {
+    pub address: String,
+    pub total: usize,
+    pub unread: usize,
+    /// Unix milliseconds.
+    pub last_received_at: i64,
+}
+
 /// Which messages to list, wait for or delete. Strings match case-insensitively.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
@@ -250,10 +260,59 @@ impl Store {
         .unwrap_or(0) as usize
     }
 
-    pub fn unread(&self) -> usize {
+    /// Unread messages among those matching.
+    pub fn unread(&self, filter: &Filter) -> usize {
+        let (clause, args) = filter.sql();
         let conn = self.conn.lock().unwrap();
-        log(conn.query_row("SELECT COUNT(*) FROM messages WHERE read = 0", [], |r| r.get::<_, i64>(0)), "count")
-            .unwrap_or(0) as usize
+        log(
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM messages m WHERE {clause} AND m.read = 0"),
+                params_from_iter(args),
+                |r| r.get::<_, i64>(0),
+            ),
+            "count",
+        )
+        .unwrap_or(0) as usize
+    }
+
+    /// Every address that has received mail (To, Cc or Bcc), most recent first, with its message and
+    /// unread counts. `q` keeps addresses containing it. Returns the page and how many matched.
+    pub fn mailboxes(&self, q: Option<&str>, limit: usize) -> (Vec<Mailbox>, usize) {
+        let pattern = q.map(str::trim).filter(|q| !q.is_empty()).map(like);
+        let filter = if pattern.is_some() { "WHERE address LIKE ?1 ESCAPE '\\'" } else { "" };
+        // An address can be on a message more than once (To and Bcc): count each message once.
+        let per_message = "SELECT DISTINCT r.address, m.id, m.read, m.received_at FROM recipients r JOIN messages m ON m.id = r.message_id";
+        let conn = self.conn.lock().unwrap();
+        let args: Vec<SqlValue> = pattern.into_iter().map(SqlValue::from).collect();
+        let total = log(
+            conn.query_row(
+                &format!("SELECT COUNT(DISTINCT address) FROM ({per_message}) {filter}"),
+                params_from_iter(args.clone()),
+                |r| r.get::<_, i64>(0),
+            ),
+            "count mailboxes",
+        )
+        .unwrap_or(0) as usize;
+        let mut page_args = args;
+        page_args.push(SqlValue::from(limit as i64));
+        let limit_param = format!("?{}", page_args.len());
+        let rows = conn
+            .prepare(&format!(
+                "SELECT address, COUNT(*), SUM(read = 0), MAX(received_at) FROM ({per_message}) {filter}
+                 GROUP BY address ORDER BY MAX(id) DESC, address LIMIT {limit_param}"
+            ))
+            .and_then(|mut stmt| {
+                stmt.query_map(params_from_iter(page_args), |r| {
+                    Ok(Mailbox {
+                        address: r.get(0)?,
+                        total: r.get::<_, i64>(1)? as usize,
+                        unread: r.get::<_, i64>(2)? as usize,
+                        last_received_at: r.get(3)?,
+                    })
+                })?
+                .collect()
+            });
+        (log(rows, "mailboxes").unwrap_or_default(), total)
     }
 
     /// The oldest matching message (the first to arrive after the filter's cursor).
@@ -287,13 +346,21 @@ impl Store {
         .flatten()
     }
 
-    pub fn set_read(&self, id: Option<i64>, read: bool) -> usize {
+    pub fn set_read(&self, id: i64, read: bool) -> usize {
         let conn = self.conn.lock().unwrap();
-        let result = match id {
-            Some(id) => conn.execute("UPDATE messages SET read = ?1 WHERE id = ?2", params![read, id]),
-            None => conn.execute("UPDATE messages SET read = ?1", params![read]),
-        };
-        log(result, "update").unwrap_or(0)
+        log(conn.execute("UPDATE messages SET read = ?1 WHERE id = ?2", params![read, id]), "update").unwrap_or(0)
+    }
+
+    /// Mark every matching message read (or unread); returns how many.
+    pub fn set_read_matching(&self, filter: &Filter, read: bool) -> usize {
+        let (clause, mut args) = filter.sql();
+        args.insert(0, SqlValue::from(read));
+        let conn = self.conn.lock().unwrap();
+        log(
+            conn.execute(&format!("UPDATE messages AS m SET read = ? WHERE {clause}"), params_from_iter(args)),
+            "update",
+        )
+        .unwrap_or(0)
     }
 
     pub fn delete(&self, id: i64) -> bool {
