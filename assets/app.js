@@ -83,7 +83,7 @@ function providerChip(id) {
   for (const p of data.providers) providerSel.append(h('option', { value: p.id }, p.name));
 
   // `mailbox`: the recipient address being shown (`?to=` in the URL), or null for all mail.
-  const state = { messages: [], selected: null, cursor: 0, tab: 'html', mailbox: null };
+  const state = { messages: [], total: 0, selected: null, cursor: 0, tab: 'html', mailbox: null };
   const mailboxFromUrl = () => new URLSearchParams(location.search).get('to')?.trim().toLowerCase() || null;
   const mailboxUrl = (address) => (address ? `/?to=${encodeURIComponent(address)}` : '/');
   state.mailbox = mailboxFromUrl();
@@ -110,33 +110,51 @@ function providerChip(id) {
     return m ? Number(m[1]) : null;
   };
 
-  /** The current mailbox as API filters. */
-  const scope = () => (state.mailbox ? { to: state.mailbox } : {});
-
-  async function load() {
-    const q = new URLSearchParams({ limit: '300', ...scope() });
+  /** What the list shows, as API filters: the open mailbox, the search and the provider. The bulk
+   * actions use the same filters, so they act on exactly the messages listed. */
+  function listFilters() {
+    const q = new URLSearchParams(state.mailbox ? { to: state.mailbox } : {});
     if (search.value.trim()) q.set('q', search.value.trim());
     if (providerSel.value) q.set('provider', providerSel.value);
+    return q;
+  }
+
+  // Loads overlap (live updates, typing, switching mailboxes); only the latest one may render.
+  let loads = 0;
+  async function load() {
+    const seq = ++loads;
+    const q = listFilters();
+    q.set('limit', '300');
     const mq = new URLSearchParams({ limit: '200' });
     if (mailboxFilter.value.trim()) mq.set('q', mailboxFilter.value.trim());
     const [res, boxes] = await Promise.all([api(`/dev/api/messages?${q}`), api(`/dev/api/mailboxes?${mq}`)]);
+    if (seq !== loads) return;
     state.messages = res.messages;
+    state.total = res.total;
     state.cursor = res.cursor;
     const filtered = search.value.trim() || providerSel.value;
     count.textContent = filtered ? `${res.total} matching` : `${res.total} message${res.total === 1 ? '' : 's'}, ${res.unread} unread`;
-    document.title = `${boxes.unread ? `(${boxes.unread}) ` : ''}${state.mailbox || 'Inbox'} · localmail`;
+    // In a mailbox, its own unread count (the list's, unless a search narrows the list).
+    const open = state.mailbox && boxes.mailboxes.find((b) => b.address === state.mailbox);
+    const unread = !state.mailbox ? boxes.unread : open ? open.unread : filtered ? null : res.unread;
+    document.title = `${unread ? `(${unread}) ` : ''}${state.mailbox || 'Inbox'} · localmail`;
     renderMailboxes(boxes);
     renderList();
   }
 
   function renderMailboxes(boxes) {
-    const item = (address, label, total, unread) => h('li', {},
-      mailboxLink(address, [h('span', { class: 'mbox-name' }, label),
-        unread ? h('span', { class: 'mbox-unread', title: `${unread} unread` }, String(unread)) : h('span', { class: 'mbox-total', title: `${total} messages` }, String(total))],
-      `mbox${(address || null) === state.mailbox ? ' current' : ''}`));
+    // `total` is null when unknown (the open mailbox, hidden by the filter or the limit).
+    const item = (address, label, total, unread) => {
+      const current = (address || null) === state.mailbox;
+      const badge = unread ? h('span', { class: 'mbox-unread', title: `${unread} unread` }, String(unread))
+        : total != null ? h('span', { class: 'mbox-total', title: `${total} messages` }, String(total)) : null;
+      const link = mailboxLink(address, [h('span', { class: 'mbox-name' }, label), badge], `mbox${current ? ' current' : ''}`);
+      if (current) link.setAttribute('aria-current', 'page');
+      return h('li', {}, link);
+    };
     const items = [item(null, 'All mail', boxes.messages, boxes.unread)];
     // The open mailbox stays listed even if the filter (or the limit) would hide it.
-    if (state.mailbox && !boxes.mailboxes.some((b) => b.address === state.mailbox)) items.push(item(state.mailbox, state.mailbox, 0, 0));
+    if (state.mailbox && !boxes.mailboxes.some((b) => b.address === state.mailbox)) items.push(item(state.mailbox, state.mailbox, null, null));
     for (const b of boxes.mailboxes) items.push(item(b.address, b.address, b.total, b.unread));
     if (boxes.total > boxes.mailboxes.length) {
       items.push(h('li', { class: 'mbox-more muted small' }, `Showing ${boxes.mailboxes.length} of ${boxes.total}. Filter to find others.`));
@@ -368,14 +386,24 @@ function providerChip(id) {
   providerSel.addEventListener('change', load);
   let mboxTimer;
   mailboxFilter.addEventListener('input', () => { clearTimeout(mboxTimer); mboxTimer = setTimeout(load, 200); });
-  // Bulk actions apply to the open mailbox only.
+  // Bulk actions apply to the messages listed: the open mailbox, narrowed by the search and provider.
   document.getElementById('lm-read-all').addEventListener('click', async () => {
-    await api(`/dev/api/messages/read?${new URLSearchParams(scope())}`, { method: 'POST' });
+    await api(`/dev/api/messages/read?${listFilters()}`, { method: 'POST' });
     load();
   });
+  /** "Delete every message?", or what exactly will go, e.g. "Delete the 2 messages to a@b.test matching "code"?" */
+  function deleteQuestion() {
+    const searchText = search.value.trim();
+    const provider = providerSel.value && providers[providerSel.value]?.name;
+    if (!state.mailbox && !searchText && !provider) return 'Delete every message?';
+    const n = state.total;
+    return `Delete ${n === 1 ? 'the 1 message' : `the ${n} messages`}${state.mailbox ? ` to ${state.mailbox}` : ''}`
+      + `${searchText ? ` matching “${searchText}”` : ''}${provider ? ` sent through ${provider}` : ''}?`;
+  }
   document.getElementById('lm-delete-all').addEventListener('click', async () => {
-    if (!confirm(state.mailbox ? `Delete every message to ${state.mailbox}?` : 'Delete every message?')) return;
-    await api(`/dev/api/messages?${new URLSearchParams(scope())}`, { method: 'DELETE' });
+    if (!state.total) return;
+    if (!confirm(deleteQuestion())) return;
+    await api(`/dev/api/messages?${listFilters()}`, { method: 'DELETE' });
     location.hash = '';
     empty();
     load();
