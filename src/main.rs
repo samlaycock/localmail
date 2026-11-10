@@ -34,6 +34,15 @@ async fn serve(args: &localmail::config::ServerArgs) -> anyhow::Result<()> {
     tracing::info!("SendGrid:         {base}/v3/mail/send");
     tracing::info!("Postmark:         {base}/email");
     tracing::info!("Resend:           {base}/emails");
+    tracing::info!("Gmail:            {base}/gmail/v1/users/me/messages/send");
+    tracing::info!("Microsoft Graph:  {base}/v1.0/me/sendMail");
+    tracing::info!("Mailgun:          {base}/v3/<domain>/messages");
+    tracing::info!("Mailjet:          {base}/v3.1/send");
+    tracing::info!("Brevo:            {base}/v3/smtp/email");
+    tracing::info!("SparkPost:        {base}/api/v1/transmissions");
+    tracing::info!("Mandrill:         {base}/api/1.0/messages/send");
+    tracing::info!("MailerSend:       {base}/v1/email");
+    tracing::info!("OAuth tokens:     {base}/token (Google), {base}/<tenant>/oauth2/v2.0/token (Microsoft)");
     tracing::info!("dev API:          {base}/dev/api/messages");
     match db {
         Some(db) => tracing::info!("messages:         {}", db.display()),

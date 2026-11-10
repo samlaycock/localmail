@@ -9,7 +9,7 @@ use serde::Deserialize;
 #[command(
     name = "localmail",
     version,
-    about = "A local SMTP server and email API emulator (SES, SendGrid, Postmark, Resend) for offline development"
+    about = "A local SMTP server and email API emulator (SES, SendGrid, Postmark, Resend, Gmail, Microsoft Graph, Mailgun, Mailjet, Brevo, SparkPost, Mandrill, MailerSend) for offline development"
 )]
 pub struct Cli {
     #[command(flatten)]

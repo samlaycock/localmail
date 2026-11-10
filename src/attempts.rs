@@ -80,6 +80,8 @@ pub struct AttemptNote {
     pub warnings: Vec<String>,
     /// Some messages of a batch were stored and some weren't.
     pub partial: bool,
+    /// What to record as the request instead of its body (token requests, minus their secrets).
+    pub request: Option<String>,
 }
 
 impl AttemptNote {
@@ -96,6 +98,7 @@ impl AttemptNote {
             error_description: None,
             warnings: vec![],
             partial: false,
+            request: None,
         }
     }
 
@@ -228,7 +231,7 @@ pub async fn record(State(state): State<AppState>, req: Request, next: Next) -> 
         error,
         error_description,
         warnings: note.warnings,
-        request,
+        request: note.request.or(request),
         response: shorten(&body),
     });
     Response::from_parts(parts, Body::from(body))

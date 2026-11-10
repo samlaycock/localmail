@@ -117,6 +117,28 @@ pub async fn setup(State(state): State<AppState>) -> Response {
             format!("POST {base}/email[/batch|/withTemplate|/batchWithTemplates]"),
         ),
         ("Resend: send and batch", format!("POST {base}/emails[/batch]")),
+        (
+            "Gmail: messages.send (raw, or uploaded with uploadType=media|multipart)",
+            format!("POST {base}[/upload]/gmail/v1/users/{{userId}}/messages/send"),
+        ),
+        (
+            "Microsoft Graph: sendMail (JSON or base64 MIME)",
+            format!("POST {base}/v1.0/me/sendMail, /v1.0/users/{{id}}/sendMail"),
+        ),
+        ("Mailgun: messages and MIME messages", format!("POST {base}/v3/{{domain}}/messages[.mime]")),
+        ("Mailjet: Send API v3.1", format!("POST {base}/v3.1/send")),
+        ("Brevo: transactional email", format!("POST {base}/v3/smtp/email")),
+        ("SparkPost: transmissions", format!("POST {base}/api/v1/transmissions")),
+        (
+            "Mandrill (Mailchimp Transactional): send, send-template, send-raw",
+            format!("POST {base}/api/1.0/messages/send[-template|-raw][.json]"),
+        ),
+        ("MailerSend: email and bulk email", format!("POST {base}/v1/email, /v1/bulk-email")),
+        ("Google OAuth: token (refresh token, code, service account JWT)", format!("POST {base}/token")),
+        (
+            "Microsoft identity platform: token (client credentials, refresh token, code, password)",
+            format!("POST {base}/{{tenant}}/oauth2/v2.0/token"),
+        ),
         ("Dev API (messages, wait, attempts, scenarios)", format!("{base}/dev/api/…")),
     ]
     .iter()
@@ -177,6 +199,80 @@ pub async fn setup(State(state): State<AppState>) -> Response {
             &format!("RESEND_BASE_URL={base}\n// or: new Resend('re_test', {{ baseUrl: '{base}' }})"),
         ),
         snippet("Resend: resend (Python)", &format!("RESEND_API_URL={base}\n# or: resend.api_url = '{base}'")),
+        snippet(
+            "Gmail: googleapis (Node)",
+            &format!(
+                "const auth = new google.auth.OAuth2();\nauth.setCredentials({{ access_token: 'test' }});\nconst gmail = google.gmail({{ version: 'v1', auth, rootUrl: '{base}/' }});\n// media uploads ignore the client's rootUrl: pass it per call too\ngmail.users.messages.send({{ userId: 'me', media }}, {{ rootUrl: '{base}/' }});"
+            ),
+        ),
+        snippet(
+            "Gmail: google-api-python-client",
+            &format!(
+                "build('gmail', 'v1', credentials=Credentials(token='test'),\n      client_options={{'api_endpoint': '{base}'}})\n# send with body={{'raw': ...}}: media uploads always go over https"
+            ),
+        ),
+        snippet(
+            "Microsoft Graph: @microsoft/microsoft-graph-client",
+            &format!(
+                "Client.init({{ baseUrl: '{base}', authProvider: (done) => done(null, 'test') }})\n// the SDK drops the token over plain http; localmail lets that through"
+            ),
+        ),
+        snippet(
+            "Microsoft Graph: msgraph-sdk (Python)",
+            &format!(
+                "auth = AzureIdentityAuthenticationProvider(credential, allowed_hosts=['localhost'])\nadapter = GraphRequestAdapter(auth)\nadapter.base_url = '{base}/v1.0'\nclient = GraphServiceClient(request_adapter=adapter)"
+            ),
+        ),
+        snippet(
+            "Mailgun: mailgun.js",
+            &format!("new Mailgun(FormData).client({{ username: 'api', key: 'test', url: '{base}' }})"),
+        ),
+        snippet("Mailgun: mailgun (Python)", &format!("Client(auth=('api', 'test'), api_url='{base}')")),
+        snippet(
+            "Mailjet: node-mailjet",
+            &format!(
+                "Mailjet.Request.protocol = 'http://';  // https is otherwise hard-coded\nMailjet.apiConnect('key', 'secret', {{ config: {{ host: '{host_port}' }} }})"
+            ),
+        ),
+        snippet("Mailjet: mailjet_rest (Python)", &format!("Client(auth=('key', 'secret'), version='v3.1', api_url='{base}/')")),
+        snippet("Brevo: @getbrevo/brevo", &format!("new BrevoClient({{ apiKey: 'test', baseUrl: '{base}/v3' }})")),
+        snippet("Brevo: brevo-python", &format!("Brevo(api_key='test', base_url='{base}/v3')")),
+        snippet("SparkPost: sparkpost (Node)", &format!("new SparkPost('test', {{ origin: '{base}' }})")),
+        snippet(
+            "SparkPost: python-sparkpost",
+            &format!("sp = SparkPost('test')\nsp.transmissions.base_uri = '{base}/api/v1'  # base_uri otherwise forces https"),
+        ),
+        snippet(
+            "Mandrill: @mailchimp/mailchimp_transactional",
+            &format!("const client = require('@mailchimp/mailchimp_transactional')('test');\nclient.basePath = '{base}/api/1.3';"),
+        ),
+        snippet(
+            "Mandrill: mailchimp-transactional (Python)",
+            &format!("client = MailchimpTransactional.Client('test')\nclient.api_client.host = '{base}/api/1.3'"),
+        ),
+        snippet(
+            "MailerSend: mailersend (Node)",
+            &format!("const ms = new MailerSend({{ apiKey: 'test' }});\nms.email.baseUrl = '{base}/v1';  // there's no option for it"),
+        ),
+        snippet("MailerSend: mailersend (Python)", &format!("MailerSendClient(api_key='test', base_url='{base}/v1')")),
+        snippet(
+            "Google OAuth: google-auth-library (Node 9.6+)",
+            &format!(
+                "new OAuth2Client({{ clientId, clientSecret,\n  endpoints: {{ oauth2TokenUrl: '{base}/token' }} }})\n// service-account JWT clients can't be pointed elsewhere: use a fixed access token"
+            ),
+        ),
+        snippet(
+            "Google OAuth: google-auth (Python)",
+            &format!(
+                "Credentials(None, refresh_token=rt, client_id=cid, client_secret=secret,\n            token_uri='{base}/token')\n# service accounts: info['token_uri'] = '{base}/token'"
+            ),
+        ),
+        snippet(
+            "Microsoft identity: @azure/msal-node",
+            &format!(
+                "new ConfidentialClientApplication({{ auth: {{ clientId, clientSecret,\n  authority: 'https://login.microsoftonline.com/<tenant>',  // MSAL needs https here\n  authorityMetadata: JSON.stringify({{\n    token_endpoint: '{base}/<tenant>/oauth2/v2.0/token',\n    authorization_endpoint: '{base}/<tenant>/oauth2/v2.0/authorize',\n    issuer: 'https://login.microsoftonline.com/<tenant>/v2.0',\n    jwks_uri: 'https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys' }}) }} }})"
+            ),
+        ),
     ]
     .concat();
 

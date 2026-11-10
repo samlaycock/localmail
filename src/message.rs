@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::address::{Addr, parse_list};
-use crate::util::{flatten_json, random_from, random_hex};
+use crate::util::{flatten_json, random_digits, random_from, random_hex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -21,11 +21,32 @@ pub enum Provider {
     Sendgrid,
     Postmark,
     Resend,
+    Gmail,
+    Graph,
+    Mailgun,
+    Mailjet,
+    Brevo,
+    Sparkpost,
+    Mandrill,
+    Mailersend,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 5] =
-        [Provider::Smtp, Provider::Ses, Provider::Sendgrid, Provider::Postmark, Provider::Resend];
+    pub const ALL: [Provider; 13] = [
+        Provider::Smtp,
+        Provider::Ses,
+        Provider::Sendgrid,
+        Provider::Postmark,
+        Provider::Resend,
+        Provider::Gmail,
+        Provider::Graph,
+        Provider::Mailgun,
+        Provider::Mailjet,
+        Provider::Brevo,
+        Provider::Sparkpost,
+        Provider::Mandrill,
+        Provider::Mailersend,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -34,6 +55,14 @@ impl Provider {
             Provider::Sendgrid => "sendgrid",
             Provider::Postmark => "postmark",
             Provider::Resend => "resend",
+            Provider::Gmail => "gmail",
+            Provider::Graph => "graph",
+            Provider::Mailgun => "mailgun",
+            Provider::Mailjet => "mailjet",
+            Provider::Brevo => "brevo",
+            Provider::Sparkpost => "sparkpost",
+            Provider::Mandrill => "mandrill",
+            Provider::Mailersend => "mailersend",
         }
     }
 
@@ -44,6 +73,14 @@ impl Provider {
             Provider::Sendgrid => "SendGrid",
             Provider::Postmark => "Postmark",
             Provider::Resend => "Resend",
+            Provider::Gmail => "Gmail",
+            Provider::Graph => "Microsoft Graph",
+            Provider::Mailgun => "Mailgun",
+            Provider::Mailjet => "Mailjet",
+            Provider::Brevo => "Brevo",
+            Provider::Sparkpost => "SparkPost",
+            Provider::Mandrill => "Mandrill",
+            Provider::Mailersend => "MailerSend",
         }
     }
 
@@ -55,6 +92,14 @@ impl Provider {
             Provider::Postmark => "#e4c200",
             // Resend's brand black disappears on a dark background.
             Provider::Resend => "#71717a",
+            Provider::Gmail => "#ea4335",
+            Provider::Graph => "#0078d4",
+            Provider::Mailgun => "#f472b6",
+            Provider::Mailjet => "#8b5cf6",
+            Provider::Brevo => "#0b996e",
+            Provider::Sparkpost => "#fa6423",
+            Provider::Mandrill => "#14b8a6",
+            Provider::Mailersend => "#84cc16",
         }
     }
 
@@ -71,6 +116,25 @@ impl Provider {
             Provider::Sendgrid => random_from(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", 22),
             Provider::Postmark | Provider::Resend => uuid::Uuid::new_v4().to_string(),
             Provider::Smtp => random_hex(8).to_ascii_uppercase(),
+            // 16 hex digits, like `18c2f1a9b3e4d5f6`.
+            Provider::Gmail => format!("1{}", &random_hex(8)[1..]),
+            // Graph's sendMail returns no id; this looks like the start of an Outlook message id.
+            Provider::Graph => format!(
+                "AAMkAG{}",
+                random_from(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", 42)
+            ),
+            // Mailgun's ids name the sending domain, so its adapter makes them.
+            Provider::Mailgun => format!("<{}.{}@localmail>", crate::util::wall_clock(), random_hex(8)),
+            // Mailjet's MessageUUID; its numeric MessageID is made by the adapter.
+            Provider::Mailjet => uuid::Uuid::new_v4().to_string(),
+            // e.g. `<202611101234.12345678901@smtp-relay.mailin.fr>`
+            Provider::Brevo => format!("<{}.{}@smtp-relay.mailin.fr>", crate::util::wall_clock(), random_digits(11)),
+            // A transmission id, e.g. `7233629436512346182`.
+            Provider::Sparkpost => format!("7{}", random_digits(18)),
+            // 32 hex digits.
+            Provider::Mandrill => random_hex(16),
+            // 24 hex digits, like a MongoDB ObjectId.
+            Provider::Mailersend => random_hex(12),
         }
     }
 }
@@ -123,6 +187,9 @@ pub struct Draft {
     /// The request (or the batch item) that described this message, for display.
     pub request: Option<Value>,
     pub envelope: Option<Envelope>,
+    /// The id to answer with, when the adapter makes it rather than [`Provider::new_message_id`]
+    /// (Mailgun's names the sending domain; a Mailgun batch shares one id).
+    pub provider_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -182,6 +249,20 @@ impl Draft {
             None => (to, cc, vec![]),
         };
         Draft { from, to, cc, bcc, reply_to, subject, raw: Some(raw), ..Default::default() }
+    }
+
+    /// A draft for MIME that a mailbox API sends as it is (Gmail, Microsoft Graph): the recipients
+    /// are the To, Cc and Bcc headers, and the Bcc header is taken out, as those services do.
+    pub fn from_sent_mime(raw: Vec<u8>) -> Draft {
+        let bcc = MessageParser::default()
+            .parse_headers(&raw)
+            .and_then(|m| {
+                m.bcc().map(|l| l.mailboxes().filter_map(|m| Some(Addr::new(m.name(), m.address()?))).collect())
+            })
+            .unwrap_or_default();
+        let mut d = Draft::from_raw(without_header(raw, "bcc"), None);
+        d.bcc = bcc;
+        d
     }
 
     /// Every recipient: To, Cc and Bcc.
@@ -312,6 +393,53 @@ impl Draft {
         }
         body
     }
+}
+
+/// Where MIME's header block ends: the start of the blank line before the body.
+fn header_end(raw: &[u8]) -> usize {
+    let crlf = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 2);
+    let lf = raw.windows(2).position(|w| w == b"\n\n").map(|p| p + 1);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b).unwrap_or(raw.len()),
+    }
+}
+
+/// Whether the header block has a `name:` field.
+pub fn has_header(raw: &[u8], name: &str) -> bool {
+    let head = &raw[..header_end(raw)];
+    head.split(|&b| b == b'\n').any(|line| is_field(line, name))
+}
+
+fn is_field(line: &[u8], name: &str) -> bool {
+    line.len() > name.len() && line[..name.len()].eq_ignore_ascii_case(name.as_bytes()) && line[name.len()] == b':'
+}
+
+/// The MIME without its `name:` header fields (continuation lines included).
+pub fn without_header(raw: Vec<u8>, name: &str) -> Vec<u8> {
+    if !has_header(&raw, name) {
+        return raw;
+    }
+    let (head, body) = raw.split_at(header_end(&raw));
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipping = false;
+    for line in head.split_inclusive(|&b| b == b'\n') {
+        if !matches!(line.first(), Some(b' ' | b'\t')) {
+            skipping = is_field(line, name);
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// The MIME with a header field added at the top.
+pub fn with_header(raw: Vec<u8>, name: &str, value: &str) -> Vec<u8> {
+    let mut out = format!("{name}: {value}\r\n").into_bytes();
+    out.extend(raw);
+    out
 }
 
 fn wrap(content_type: &'static str, mut parts: Vec<MimePart<'static>>) -> MimePart<'static> {
