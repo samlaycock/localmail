@@ -6,7 +6,7 @@
 
 A local SMTP server and email API emulator for offline development and testing. It's a single Rust binary (or Docker image) with no external services. It keeps every message instead of delivering it and shows them in a web inbox. It's a sibling of [localoidc](https://github.com/samlaycock/localoidc), [localsaml](https://github.com/samlaycock/localsaml) and [localflake](https://github.com/samlaycock/localflake).
 
-- **SMTP and the provider APIs.** Besides SMTP, it emulates the sending APIs of **Amazon SES** (v2 and v1), **SendGrid**, **Postmark** and **Resend**. Point the official SDK at localmail and your code runs unchanged: the same request validation, response shapes, message ID formats and error bodies as the real service.
+- **SMTP and the provider APIs.** Besides SMTP, it emulates the sending APIs of **Amazon SES** (v2 and v1), **SendGrid**, **Postmark**, **Resend**, **Mailgun**, **Mailjet**, **Brevo**, **SparkPost**, **Mailchimp Transactional** (Mandrill) and **MailerSend**, and the mailbox APIs of **Gmail** and **Microsoft Graph** (Outlook), with their [OAuth token endpoints](#oauth-tokens). Point the official SDK at localmail and your code runs unchanged: the same request validation, response shapes, message ID formats and error bodies as the real service.
 - **A web inbox.** Read each message's HTML (sandboxed), text, headers, MIME source and attachments, plus the exact API request your app sent. One-time codes and links are pulled out for you.
 - **Failures on demand.** Send to a [scenario address](#scenario-addresses) such as `ratelimit@localmail.test` or `flaky-2@localmail.test`, and the send fails the way the provider would: a 429 with SendGrid's body, SES's `MessageRejected`, an SMTP `451`, and so on. Your app's error handling and retries get tested without a real outage.
 - **Built for automated tests.** A [dev API](#test-automation) waits for the next email to an address and returns its one-time code or links. Wait from a cursor so earlier messages never confuse a test, and use unique addresses so parallel tests don't interfere.
@@ -21,6 +21,7 @@ A local SMTP server and email API emulator for offline development and testing. 
 - [Quick start](#quick-start)
 - [Pointing your app at localmail](#pointing-your-app-at-localmail)
 - [What each provider emulates](#what-each-provider-emulates)
+- [OAuth tokens](#oauth-tokens)
 - [Scenario addresses](#scenario-addresses)
 - [Test automation](#test-automation)
 - [The inbox](#the-inbox)
@@ -78,6 +79,14 @@ Every API accepts any credentials, but it still expects the kind its provider us
 | SendGrid | `POST /v3/mail/send` | Node: `sgMail.client.setDefaultRequest('baseUrl', 'http://localhost:9402')`, called *after* `setApiKey`, which resets it. Python: `SendGridAPIClient(key, host='http://localhost:9402')` |
 | Postmark | `POST /email`, `/email/batch`, `/email/withTemplate`, `/email/batchWithTemplates` | Node: `new ServerClient(token, { useHttps: false, requestHost: 'localhost:9402' })`. Python (postmarker): `PostmarkClient(server_token=t, root_api_url='http://localhost:9402/')` |
 | Resend | `POST /emails`, `/emails/batch` | Node: `RESEND_BASE_URL=http://localhost:9402` or `new Resend(key, { baseUrl })`. Python: `RESEND_API_URL=http://localhost:9402` |
+| Gmail | `POST /gmail/v1/users/{userId}/messages/send`, `POST /upload/gmail/v1/users/{userId}/messages/send` | Node (`googleapis`): `google.gmail({ version: 'v1', auth, rootUrl: 'http://localhost:9402/' })`. Python: `build('gmail', 'v1', credentials=…, client_options={'api_endpoint': 'http://localhost:9402'})` |
+| Microsoft Graph | `POST /v1.0/me/sendMail`, `/v1.0/users/{id}/sendMail` (and `/beta`) | Node: `Client.init({ baseUrl: 'http://localhost:9402', authProvider })`. Python (`msgraph-sdk`): `adapter.base_url = 'http://localhost:9402/v1.0'`, with `allowed_hosts=['localhost']` on the auth provider |
+| Mailgun | `POST /v3/{domain}/messages`, `/v3/{domain}/messages.mime` | Node: `new Mailgun(FormData).client({ username: 'api', key, url: 'http://localhost:9402' })`. Python (`mailgun`): `Client(auth=('api', key), api_url='http://localhost:9402')` |
+| Mailjet | `POST /v3.1/send` | Node: `Mailjet.Request.protocol = 'http://'`, then `Mailjet.apiConnect(key, secret, { config: { host: 'localhost:9402' } })`. Python: `Client(auth=(key, secret), version='v3.1', api_url='http://localhost:9402/')` |
+| Brevo | `POST /v3/smtp/email` | Node: `new BrevoClient({ apiKey, baseUrl: 'http://localhost:9402/v3' })`. Python: `Brevo(api_key=key, base_url='http://localhost:9402/v3')` |
+| SparkPost | `POST /api/v1/transmissions` | Node: `new SparkPost(key, { origin: 'http://localhost:9402' })`. Python: `sp.transmissions.base_uri = 'http://localhost:9402/api/v1'` |
+| Mailchimp Transactional | `POST /api/1.3/messages/send`, `/send-template`, `/send-raw` (also `.json`, and `/api/1.0`) | Node: `client.basePath = 'http://localhost:9402/api/1.3'`. Python: `client.api_client.host = 'http://localhost:9402/api/1.3'` |
+| MailerSend | `POST /v1/email`, `/v1/bulk-email` | Node: `ms.email.baseUrl = 'http://localhost:9402/v1'`. Python: `MailerSendClient(api_key=key, base_url='http://localhost:9402/v1')` |
 
 For example, with the AWS SDK for JavaScript v3:
 
@@ -92,6 +101,13 @@ await ses.send(new SendEmailCommand({ FromEmailAddress: 'app@example.com', /* �
 
 These SDKs are exercised against localmail: `@aws-sdk/client-sesv2`, `@aws-sdk/client-ses`, `@sendgrid/mail`, `postmark`, `resend` and `nodemailer`. Errors reach your code as each SDK's own error types, for example Postmark's `InactiveRecipientsError` or AWS's `MessageRejected` and `TooManyRequestsException`.
 
+Some SDKs need a nudge to talk plain `http://` to a local host:
+
+- **googleapis (Node)** ignores the client's `rootUrl` for media uploads (`messages.send` with `media`), so pass `{ rootUrl }` as the call's options too. **google-api-python-client** always sends media uploads over https, so send `raw` instead.
+- **@microsoft/microsoft-graph-client** strips the `Authorization` header from any non-https request. localmail lets a Graph request with no `Authorization` header at all through, with a warning in the [attempts log](#attempts), and still refuses one with a malformed token. **msgraph-sdk (Python)** needs `allowed_hosts=['localhost']` (the host without its port), or it silently sends no token.
+- **node-mailjet** hard-codes `https://`; set `Mailjet.Request.protocol = 'http://'`. **python-sparkpost** prefixes `https://` to `base_uri`, so set `sp.transmissions.base_uri` after creating the client. **mailersend (Node)** has no base URL option; set `ms.email.baseUrl`.
+- **mailgun (Python)** and **mailjet_rest** allow plain http only to `localhost`, `127.0.0.1` and `::1`.
+
 ## What each provider emulates
 
 Only sending: localmail doesn't send webhooks, receive email or manage suppression lists, domains or templates. Each API validates requests the way its provider does, answers with the provider's response shape and message ID format, and fails with the provider's error format and status codes.
@@ -102,9 +118,42 @@ Only sending: localmail doesn't send webhooks, receive email or manage suppressi
 - **Postmark** (`/email`, `/email/withTemplate`, and both batch endpoints). Returns `To`, `SubmittedAt`, `MessageID`, `ErrorCode` and `Message`, with Postmark's error codes (`10`, `300`, `402`, `406`, `1101`, …). Batches answer `200` with a result per message, so one bad message doesn't fail the rest. Allows at most 50 recipients and 500 messages per batch.
 - **Resend** (`/emails` and `/emails/batch`). Errors are `{"statusCode","message","name"}`. Batches are all-or-nothing unless sent with `x-batch-validation: permissive`, which returns `errors` by index. Allows at most 50 `to` addresses and 100 emails per batch. Attachments given by `path` aren't fetched (localmail is offline); a note takes their place.
 
-**Template sends.** SendGrid dynamic templates, Postmark templates, SES stored templates and Resend templates live in the provider account, which localmail can't see. Such a message records the template's ID and data, and its body lists the data, so codes and links in the data can still be [extracted](#test-automation).
+- **Gmail** (`users.messages.send`). The message is the MIME you send, as base64url `raw` JSON, or uploaded with `uploadType=media` (the bare message) or `uploadType=multipart` (JSON metadata, then the message). Resumable uploads aren't emulated. As Gmail does, the Bcc header is removed but its recipients still get the message, and a message without a From is from the sending mailbox: the `userId` when it's an address, or the user a [localmail token](#oauth-tokens) was issued for. Answers `{id, threadId, labelIds: ["SENT"]}`; errors are Google's `{"error": {code, message, errors, status}}`.
+- **Microsoft Graph** (`sendMail`). JSON (`toRecipients`, `body`, `attachments` with `#microsoft.graph.fileAttachment`, `internetMessageHeaders`, `categories`, …, in camelCase or the Python SDK's PascalCase), or MIME sent base64-encoded as `text/plain`. Answers `202` with no body, as Graph does. Errors are `{"error": {code, message, innerError}}` (`ErrorInvalidRecipients`, `InvalidInternetMessageHeader`, `ErrorMimeContentInvalidBase64String`, `TooManyRequests` with `Retry-After`, …). Custom header names must start with `x-`, and there can be at most 5.
+- **Mailgun** (`messages` and `messages.mime`). Multipart or URL-encoded forms, with repeated `to` fields, `attachment` and `inline` files, `o:` options, `h:` headers, `v:` variables and `template`. With `recipient-variables`, each `to` recipient gets a message of their own with `%recipient.name%` filled in, all under the one id. Ids name the sending domain, e.g. `<20261110120000.12345.AB12CD34@mg.example.com>`. Bad credentials get Mailgun's bare `401 Forbidden`.
+- **Mailjet** (Send API v3.1). Each of the `Messages` (up to 50, with `Globals` merged in) is its own message, with `TemplateLanguage` `{{var:name}}` variables filled in. Valid messages are sent even when others fail; the answer lists each message's `Status`, with `MessageUUID`/`MessageID` per recipient or `Errors` using Mailjet's codes (`mj-0003`, `mj-0013`, `send-0003`, …), and is a `400` if any failed. `SandboxMode` messages are kept but answered without ids.
+- **Brevo** (`/v3/smtp/email`, with an `api-key` header). `{{ params.name }}` is filled in from `params`. With `messageVersions`, each version is its own message, with its own recipients, subject and `params`, and the answer is `messageIds`. Errors are `{code, message}` (`missing_parameter`, `invalid_parameter`, `unauthorized`, …). Attachments given by `url` aren't fetched.
+- **SparkPost** (transmissions, with the API key as the whole `Authorization` header). Each recipient gets a message of their own, with `{{name}}` filled in from the transmission's and the recipient's `substitution_data`; they share the transmission's id. A recipient whose `header_to` names someone else is a Cc (if the `CC` header lists them) or a Bcc. An invalid recipient makes the answer SparkPost's `422` "transmission created, but with validation errors" listing it in `rcpt_to_errors`. Stored recipient lists (`list_id`) aren't supported.
+- **Mailchimp Transactional** (Mandrill: `send`, `send-template`, `send-raw`). The API key is the `key` field of the body. Unless `preserve_recipients` is set, each recipient gets a message of their own with their `merge_vars` (`*|NAME|*`, or `{{name}}` with `merge_language: handlebars`) filled in. The answer has an entry per recipient with its status: `sent`, `queued` (`async`), `scheduled` (`send_at`), `rejected` or `invalid`. Errors are `{status: "error", code, name, message}`, and required parameters are checked before the key, as Mandrill does.
+- **MailerSend** (`/v1/email` and `/v1/bulk-email`). `personalization` data fills in `{{ name }}`; with several `to` recipients that have personalization, each gets a copy with their own. `/v1/email` answers `202` with `X-Message-Id`; `/v1/bulk-email` answers with a `bulk_email_id`, and, as with MailerSend, its invalid emails don't fail the request. Validation errors are `422 {"message": "The given data was invalid.", "errors": {field: [...]}}`.
+
+**Template sends.** A template stored in the provider account (a SendGrid dynamic template, or a Postmark, SES, Resend, Mailgun, Mailjet, Brevo, SparkPost, Mandrill or MailerSend template) is out of localmail's sight. A message sent with one records the template's ID and data, and its body lists the data, so codes and links in the data can still be [extracted](#test-automation).
 
 **Error messages.** Error bodies follow each provider's documented format. The message text matches the provider's own where it's documented, and is close to it elsewhere. Postmark doesn't document its 429 and 500 bodies, and its SDK goes by the HTTP status.
+
+## OAuth tokens
+
+Gmail and Microsoft Graph clients get an access token before they send, so localmail emulates those token endpoints too. Any client ID and secret are accepted, but each grant's required parameters are checked, and errors come back in the provider's format. Token requests appear in the [attempts log](#attempts) with their secrets (client secrets, refresh tokens, codes, assertions, passwords) redacted.
+
+| | Endpoint | Grants |
+|---|---|---|
+| Google (`oauth2.googleapis.com`) | `POST /token`, `/oauth2/v4/token` | `refresh_token` and `authorization_code` (with `client_id` and `client_secret`), and the service-account JWT bearer grant (`urn:ietf:params:oauth:grant-type:jwt-bearer`, whose assertion needs a `scope` claim) |
+| Microsoft identity platform (`login.microsoftonline.com`) | `POST /{tenant}/oauth2/v2.0/token`, `GET /{tenant}/v2.0/.well-known/openid-configuration` | `client_credentials` (a `/.default` scope, and a secret or assertion), `refresh_token`, `authorization_code`, `password` and on-behalf-of. Delegated grants return a refresh token and `client_info`, plus an `id_token` with `openid`. |
+
+- **Whose mailbox.** A token issued for a user tells localmail whose mailbox `users/me` (Gmail) or `/me` (Graph) is, so a message without a From is from them. That user is the `sub` of a service-account assertion (domain-wide delegation) or the `username` of a password grant. Real Entra ID tokens with a `upn` work too.
+- **Failures on demand.** A refresh token, code or assertion of `revoked` fails with `invalid_grant` (Google's `Token has been expired or revoked.`, Entra's `AADSTS70008`). A client secret of `invalid` fails with `401 invalid_client` (Entra's `AADSTS7000215`).
+- A token isn't needed to send: Gmail and Graph accept any bearer token, so a client given a fixed access token can skip this step.
+
+**Pointing Google's libraries at it:**
+
+- Node (`google-auth-library` 9.6 or later): `new OAuth2Client({ clientId, clientSecret, endpoints: { oauth2TokenUrl: 'http://localhost:9402/token' } })`. Service-account (`JWT`) clients ignore the key file's `token_uri` and have no option for it. Either route their transport's requests for `https://oauth2.googleapis.com` to localmail (a `Gaxios` interceptor), or give the Gmail client a fixed access token instead.
+- Python (`google-auth`): `Credentials(None, refresh_token=…, client_id=…, client_secret=…, token_uri='http://localhost:9402/token')`. `Credentials.from_authorized_user_info()` always resets `token_uri`, so call `.with_token_uri(...)` on its result. For service accounts, set `"token_uri": "http://localhost:9402/token"` in the key info.
+
+**Pointing Microsoft's libraries at it.** MSAL and `azure-identity` refuse an `http://` authority, so keep the real `https://login.microsoftonline.com/<tenant>` authority and send its requests to localmail:
+
+- MSAL Node: give the endpoints as `authorityMetadata`, a JSON string with `token_endpoint: 'http://localhost:9402/<tenant>/oauth2/v2.0/token'` (plus `authorization_endpoint`, `issuer` and `jwks_uri`). MSAL then makes no discovery requests.
+- `@azure/identity` (Node): add a per-retry policy in `additionalPolicies` that rewrites `https://login.microsoftonline.com` to `http://localhost:9402`, and set `allowInsecureConnection: true`.
+- MSAL Python: pass an `http_client` that rewrites `https://login.microsoftonline.com` to `http://localhost:9402`. localmail serves the openid-configuration it fetches.
 
 ## Scenario addresses
 
@@ -112,7 +161,7 @@ Send to one of these addresses at `localmail.test` (a reserved TLD that can neve
 
 | Address | SMTP | APIs |
 |---|---|---|
-| `reject@localmail.test` | `550 5.1.1` at `RCPT TO`; the other recipients still get the message | A permanent rejection. SES `MessageRejected` (address not verified); Postmark `406` (inactive recipient), per message in batches; SendGrid and Resend `400`/`422`. |
+| `reject@localmail.test` | `550 5.1.1` at `RCPT TO`; the other recipients still get the message | A permanent rejection. SES `MessageRejected` (address not verified); Postmark `406` (inactive recipient), per message in batches; SendGrid and Resend `400`/`422`. Where a provider reports suppressed recipients rather than failing, so does localmail: Mandrill's `rejected` status, SparkPost's `total_rejected_recipients`, Mailjet's per-message error, MailerSend's `202` with an `ALL_SUPPRESSED` warning. |
 | `unauthorized@localmail.test` | `530 5.7.0` | The credentials are refused: `401`, or SES `403 UnrecognizedClientException` |
 | `ratelimit@localmail.test` | `451 4.7.1` | `429` with the provider's body and rate-limit headers. SES v1 answers `400 Throttling`. |
 | `error@localmail.test` | `451 4.3.0` | `500` with the provider's body |
@@ -170,7 +219,7 @@ await page.getByLabel('Code').fill(extracted.otp);
 | `to` | Any recipient (To, Cc or Bcc), case-insensitively |
 | `from` | The sender's address |
 | `subject` / `subject_contains` | The whole subject / part of it, case-insensitively |
-| `provider` | `smtp`, `ses`, `sendgrid`, `postmark` or `resend` |
+| `provider` | `smtp`, `ses`, `sendgrid`, `postmark`, `resend`, `gmail`, `graph`, `mailgun`, `mailjet`, `brevo`, `sparkpost`, `mandrill` or `mailersend` |
 | `after` | Messages newer than this cursor |
 | `q` | Free text over subject, sender and recipients |
 

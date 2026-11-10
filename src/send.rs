@@ -166,7 +166,7 @@ pub async fn submit(
             results.push(ItemResult::Failed(Failure::Rejected(addr)));
             continue;
         }
-        let message_id = provider.new_message_id();
+        let message_id = draft.provider_message_id.clone().unwrap_or_else(|| provider.new_message_id());
         let to = draft.to.clone();
         let msg = NewMessage::from_draft(draft, provider, endpoint, message_id.clone(), plan.applied.clone());
         match state.store.insert(&msg) {

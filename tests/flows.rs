@@ -917,3 +917,966 @@ async fn mailboxes_list_each_recipient_with_counts() {
     assert_eq!(get(&app, "/dev/api/mailboxes?to=x").await.status, StatusCode::BAD_REQUEST);
     assert_eq!(get(&app, "/dev/api/mailboxes?q=100%25_").await.json()["total"], 0);
 }
+
+// ---------------------------------------------------------------------------
+// Gmail
+// ---------------------------------------------------------------------------
+
+const BEARER: (&str, &str) = ("authorization", "Bearer ya29.test");
+
+fn b64url(data: &str) -> String {
+    b64_std(data).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
+}
+
+fn has_header(m: &Value, name: &str) -> bool {
+    m["headers"].as_array().unwrap().iter().any(|h| h["name"].as_str().unwrap().eq_ignore_ascii_case(name))
+}
+
+#[tokio::test]
+async fn gmail_sends_raw_mime_and_uploads() {
+    let (app, _) = app();
+    let mime =
+        "To: Alice <alice@example.com>\r\nBcc: audit@example.com\r\nSubject: Your code\r\n\r\nYour code is 482913\r\n";
+    let r = post_json(
+        &app,
+        "/gmail/v1/users/me@acme.test/messages/send",
+        &[BEARER],
+        json!({ "raw": b64url(mime), "threadId": "t1" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let body = r.json();
+    assert_eq!(body["labelIds"], json!(["SENT"]));
+    assert_eq!(body["threadId"], "t1");
+    assert_eq!(body["id"].as_str().unwrap().len(), 16);
+    let m = latest(&app, "alice@example.com").await;
+    assert_eq!(m["provider"], "gmail");
+    assert_eq!(m["provider_message_id"], body["id"]);
+    assert_eq!(m["subject"], "Your code");
+    // The userId is the sender when the message has no From; Bcc is delivered but not shown.
+    assert_eq!(m["from"]["email"], "me@acme.test");
+    assert_eq!(m["bcc"][0]["email"], "audit@example.com");
+    assert!(!has_header(&m, "bcc"));
+    assert_eq!(m["details"]["threadId"], "t1");
+    assert_eq!(latest(&app, "audit@example.com").await["id"], m["id"]);
+
+    // uploadType=media: the bare message.
+    let r = call(
+        &app,
+        Method::POST,
+        "/upload/gmail/v1/users/me/messages/send?uploadType=media",
+        &[BEARER, ("content-type", "message/rfc822")],
+        "From: app@acme.test\r\nTo: media@example.com\r\nSubject: Media\r\n\r\nhi\r\n",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(latest(&app, "media@example.com").await["subject"], "Media");
+
+    // uploadType=multipart: JSON metadata, then the message (what googleapis sends with `media`).
+    let body = "--b1\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{\"threadId\":\"t9\"}\r\n--b1\r\nContent-Type: message/rfc822\r\n\r\nFrom: app@acme.test\r\nTo: multi@example.com\r\nSubject: Multi\r\n\r\nhi\r\n--b1--\r\n";
+    let r = call(
+        &app,
+        Method::POST,
+        "/upload/gmail/v1/users/me/messages/send?uploadType=multipart",
+        &[BEARER, ("content-type", "multipart/related; boundary=b1")],
+        body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(r.json()["threadId"], "t9");
+    assert_eq!(latest(&app, "multi@example.com").await["text"], "hi");
+}
+
+#[tokio::test]
+async fn gmail_user_id_is_the_sender() {
+    let (app, _) = app();
+    // Clients percent-encode the address in the path.
+    let r = post_json(
+        &app,
+        "/gmail/v1/users/ann%40acme.test/messages/send",
+        &[BEARER],
+        json!({ "raw": b64url("To: bob@example.com\r\nSubject: Hi\r\n\r\nhi") }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let m = latest(&app, "bob@example.com").await;
+    assert_eq!(m["from"]["email"], "ann@acme.test");
+    assert!(has_header(&m, "from"));
+    assert_eq!(m["endpoint"], "POST /gmail/v1/users/ann@acme.test/messages/send");
+
+    // A From in the message is kept.
+    let raw = b64url("From: Ann <ann@acme.test>\r\nTo: carol@example.com\r\nSubject: Hi\r\n\r\nhi");
+    post_json(&app, "/gmail/v1/users/ann@acme.test/messages/send", &[BEARER], json!({ "raw": raw })).await;
+    assert_eq!(latest(&app, "carol@example.com").await["from"]["name"], "Ann");
+}
+
+#[tokio::test]
+async fn gmail_errors_look_like_googles() {
+    let (app, _) = app();
+    let path = "/gmail/v1/users/me/messages/send";
+    let raw = b64url("From: a@acme.test\r\nTo: b@example.com\r\nSubject: x\r\n\r\nx");
+    let r = post_json(&app, path, &[], json!({ "raw": raw })).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.json()["error"]["status"], "UNAUTHENTICATED");
+    assert_eq!(r.json()["error"]["errors"][0]["reason"], "required");
+
+    let r = post_json(&app, path, &[BEARER], json!({})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["error"]["status"], "INVALID_ARGUMENT");
+    assert!(r.json()["error"]["message"].as_str().unwrap().starts_with("'raw' RFC822 payload"));
+
+    let r =
+        post_json(&app, path, &[BEARER], json!({ "raw": b64url("From: a@acme.test\r\nSubject: x\r\n\r\nx") })).await;
+    assert_eq!(r.json()["error"]["message"], "Recipient address required");
+
+    let r = post_json(
+        &app,
+        path,
+        &[BEARER],
+        json!({ "raw": b64url("To: ratelimit@localmail.test\r\nSubject: x\r\n\r\nx") }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.json()["error"]["errors"][0]["reason"], "rateLimitExceeded");
+
+    let r = call(
+        &app,
+        Method::POST,
+        "/upload/gmail/v1/users/me/messages/send?uploadType=media",
+        &[BEARER, ("content-type", "application/json")],
+        "{}",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.json()["error"]["message"].as_str().unwrap().contains("message/*"));
+}
+
+// ---------------------------------------------------------------------------
+// Microsoft Graph
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn graph_send_mail_json_and_mime() {
+    let (app, _) = app();
+    let r = post_json(
+        &app,
+        "/v1.0/users/sender@acme.test/sendMail",
+        &[BEARER, ("client-request-id", "abc-123")],
+        json!({
+            "message": {
+                "subject": "Quarterly report",
+                "body": { "contentType": "HTML", "content": "<p>Attached.</p>" },
+                "toRecipients": [{ "emailAddress": { "address": "alice@example.com", "name": "Alice" } }],
+                "ccRecipients": [{ "emailAddress": { "address": "carol@example.com" } }],
+                "bccRecipients": [{ "emailAddress": { "address": "audit@example.com" } }],
+                "replyTo": [{ "emailAddress": { "address": "help@acme.test" } }],
+                "internetMessageHeaders": [{ "name": "x-campaign", "value": "q3" }],
+                "categories": ["reports"],
+                "attachments": [{ "@odata.type": "#microsoft.graph.fileAttachment", "name": "q3.csv", "contentType": "text/csv", "contentBytes": b64_std("a,b\n") }]
+            },
+            "saveToSentItems": false
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    assert_eq!(r.text, "");
+    assert_eq!(r.header("client-request-id"), "abc-123");
+    let m = latest(&app, "alice@example.com").await;
+    assert_eq!(m["provider"], "graph");
+    assert_eq!(m["from"]["email"], "sender@acme.test");
+    assert_eq!(m["html"], "<p>Attached.</p>");
+    assert_eq!(m["cc"][0]["email"], "carol@example.com");
+    assert_eq!(m["bcc"][0]["email"], "audit@example.com");
+    assert_eq!(m["reply_to"][0]["email"], "help@acme.test");
+    assert_eq!(m["tags"], json!(["reports"]));
+    assert_eq!(m["details"]["saveToSentItems"], false);
+    assert_eq!(m["attachments"][0]["filename"], "q3.csv");
+    assert!(has_header(&m, "x-campaign"));
+
+    // MIME, base64-encoded as text/plain.
+    let mime = "From: me@acme.test\r\nTo: mime@example.com\r\nBcc: hidden@example.com\r\nSubject: Raw\r\n\r\nhello\r\n";
+    let r =
+        call(&app, Method::POST, "/v1.0/me/sendMail", &[BEARER, ("content-type", "text/plain")], b64_std(mime)).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    let m = latest(&app, "mime@example.com").await;
+    assert_eq!(m["subject"], "Raw");
+    assert_eq!(m["bcc"][0]["email"], "hidden@example.com");
+    assert!(!has_header(&m, "bcc"));
+}
+
+#[tokio::test]
+async fn graph_errors_look_like_graphs() {
+    let (app, _) = app();
+    let msg = |to: &str| json!({ "message": { "subject": "x", "body": { "contentType": "Text", "content": "x" }, "toRecipients": [{ "emailAddress": { "address": to } }] } });
+    // No Authorization header at all gets through (the Graph JS SDK drops it over plain http),
+    // with a warning in the attempts log; one that isn't a bearer token doesn't.
+    let r = post_json(&app, "/v1.0/me/sendMail", &[], msg("a@example.com")).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    assert!(attempts(&app).await[0]["warnings"][0].as_str().unwrap().contains("no access token"));
+    let r = post_json(&app, "/v1.0/me/sendMail", &[("authorization", "Basic dGVzdA==")], msg("a@example.com")).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.json()["error"]["code"], "InvalidAuthenticationToken");
+    assert!(r.json()["error"]["innerError"]["request-id"].is_string());
+    assert!(r.header("www-authenticate").starts_with("Bearer realm"));
+
+    // The Python SDK's PascalCase names work too.
+    let r = post_json(
+        &app,
+        "/v1.0/me/sendMail",
+        &[BEARER],
+        json!({ "Message": { "@odata.type": "#microsoft.graph.message", "Subject": "Pascal", "Body": { "ContentType": "text", "Content": "x" },
+                "ToRecipients": [{ "EmailAddress": { "Address": "pascal@example.com" } }] }, "SaveToSentItems": false }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    assert_eq!(latest(&app, "pascal@example.com").await["subject"], "Pascal");
+
+    let r = post_json(&app, "/v1.0/me/sendMail", &[BEARER], json!({ "message": { "subject": "x" } })).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["error"]["code"], "ErrorInvalidRecipients");
+
+    let mut bad_header = msg("a@example.com");
+    bad_header["message"]["internetMessageHeaders"] = json!([{ "name": "Campaign", "value": "x" }]);
+    let r = post_json(&app, "/v1.0/me/sendMail", &[BEARER], bad_header).await;
+    assert_eq!(r.json()["error"]["code"], "InvalidInternetMessageHeader");
+
+    let r = post_json(&app, "/v1.0/me/sendMail", &[BEARER], msg("ratelimit@localmail.test")).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.header("retry-after"), "10");
+    assert_eq!(r.json()["error"]["code"], "TooManyRequests");
+}
+
+// ---------------------------------------------------------------------------
+// Mailgun
+// ---------------------------------------------------------------------------
+
+const MG: (&str, &str) = ("authorization", "Basic YXBpOmtleS10ZXN0"); // api:key-test
+
+/// A multipart/form-data body: text fields, then files as (field, filename, type, content).
+fn multipart(fields: &[(&str, &str)], files: &[(&str, &str, &str, &[u8])]) -> (String, Vec<u8>) {
+    let boundary = "lmboundary";
+    let mut body = vec![];
+    for (k, v) in fields {
+        body.extend(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes());
+    }
+    for (k, filename, ct, content) in files {
+        body.extend(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{filename}\"\r\nContent-Type: {ct}\r\n\r\n").as_bytes(),
+        );
+        body.extend(*content);
+        body.extend(b"\r\n");
+    }
+    body.extend(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+#[tokio::test]
+async fn mailgun_messages_batches_and_mime() {
+    let (app, _) = app();
+    let (ct, body) = multipart(
+        &[
+            ("from", "Acme <app@mg.acme.test>"),
+            ("to", "alice@example.com"),
+            ("to", "bob@example.com"),
+            ("subject", "Hi %recipient.name%"),
+            ("text", "Your code is %recipient.code%"),
+            (
+                "recipient-variables",
+                r#"{"alice@example.com":{"name":"Alice","code":"111111"},"bob@example.com":{"name":"Bob","code":"222222"}}"#,
+            ),
+            ("o:tag", "welcome"),
+            ("o:testmode", "yes"),
+            ("h:Reply-To", "help@acme.test"),
+            ("h:X-Campaign", "fall"),
+            ("v:user_id", "42"),
+        ],
+        &[("attachment", "report.csv", "text/csv", b"a,b\n")],
+    );
+    let r = call(&app, Method::POST, "/v3/mg.acme.test/messages", &[MG, ("content-type", &ct)], body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let body = r.json();
+    assert_eq!(body["message"], "Queued. Thank you.");
+    let id = body["id"].as_str().unwrap();
+    assert!(id.starts_with('<') && id.ends_with("@mg.acme.test>"), "{id}");
+
+    let alice = latest(&app, "alice@example.com").await;
+    assert_eq!(alice["subject"], "Hi Alice");
+    assert_eq!(alice["text"], "Your code is 111111");
+    assert_eq!(alice["to"].as_array().unwrap().len(), 1);
+    assert_eq!(alice["provider_message_id"], id);
+    assert_eq!(alice["tags"], json!(["welcome"]));
+    assert_eq!(alice["reply_to"][0]["email"], "help@acme.test");
+    assert_eq!(alice["details"]["options"]["testmode"], "yes");
+    assert_eq!(alice["details"]["variables"]["user_id"], "42");
+    assert_eq!(alice["attachments"][0]["filename"], "report.csv");
+    assert!(has_header(&alice, "x-campaign"));
+    assert_eq!(latest(&app, "bob@example.com").await["subject"], "Hi Bob");
+
+    // URL-encoded forms work too.
+    let r = call(
+        &app,
+        Method::POST,
+        "/v3/mg.acme.test/messages",
+        &[MG, ("content-type", "application/x-www-form-urlencoded")],
+        form(&[
+            ("from", "app@mg.acme.test"),
+            ("to", "carol@example.com, dan@example.com"),
+            ("subject", "Plain"),
+            ("html", "<p>x</p>"),
+        ]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(latest(&app, "dan@example.com").await["to"].as_array().unwrap().len(), 2);
+
+    let (ct, body) = multipart(
+        &[("to", "mime@example.com")],
+        &[(
+            "message",
+            "message.mime",
+            "message/rfc822",
+            b"From: app@mg.acme.test\r\nTo: mime@example.com\r\nSubject: MIME\r\n\r\nraw\r\n",
+        )],
+    );
+    let r = call(&app, Method::POST, "/v3/mg.acme.test/messages.mime", &[MG, ("content-type", &ct)], body).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(latest(&app, "mime@example.com").await["subject"], "MIME");
+}
+
+#[tokio::test]
+async fn mailgun_errors_look_like_mailguns() {
+    let (app, _) = app();
+    let urlencoded = ("content-type", "application/x-www-form-urlencoded");
+    let ok = form(&[("from", "app@mg.acme.test"), ("to", "a@example.com"), ("subject", "x"), ("text", "x")]);
+    let r = call(&app, Method::POST, "/v3/mg.acme.test/messages", &[urlencoded], ok).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.text, "Forbidden");
+
+    let r = call(&app, Method::POST, "/v3/mg.acme.test/messages", &[MG, urlencoded], form(&[("to", "a@example.com")]))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json(), json!({ "message": "from parameter is missing" }));
+
+    let r = call(
+        &app,
+        Method::POST,
+        "/v3/mg.acme.test/messages",
+        &[MG, urlencoded],
+        form(&[("from", "app@mg.acme.test"), ("to", "a@example.com"), ("subject", "x")]),
+    )
+    .await;
+    assert_eq!(
+        r.json()["message"],
+        "Need at least one of 'text', 'html', 'amp-html' or 'template' parameters specified"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mailjet
+// ---------------------------------------------------------------------------
+
+const MJ: (&str, &str) = ("authorization", "Basic a2V5OnNlY3JldA=="); // key:secret
+
+#[tokio::test]
+async fn mailjet_send_v31() {
+    let (app, _) = app();
+    let r = post_json(
+        &app,
+        "/v3.1/send",
+        &[MJ],
+        json!({
+            "Globals": { "From": { "Email": "app@acme.test", "Name": "Acme" }, "Subject": "Hello {{var:name:\"there\"}}" },
+            "Messages": [
+                { "To": [{ "Email": "alice@example.com", "Name": "Alice" }], "Cc": [{ "Email": "carol@example.com" }],
+                  "TextPart": "Code {{var:code}}", "TemplateLanguage": true, "Variables": { "name": "Alice", "code": "123456" },
+                  "CustomID": "signup-1", "Headers": { "X-Campaign": "fall" },
+                  "Attachments": [{ "ContentType": "text/plain", "Filename": "a.txt", "Base64Content": b64_std("hi") }] },
+                { "To": [{ "Email": "bob@example.com" }], "HTMLPart": "<p>Hi</p>", "TemplateLanguage": true }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let body = r.json();
+    assert_eq!(body["Messages"][0]["Status"], "success");
+    assert_eq!(body["Messages"][0]["CustomID"], "signup-1");
+    assert_eq!(body["Messages"][0]["To"][0]["Email"], "alice@example.com");
+    assert!(body["Messages"][0]["To"][0]["MessageID"].is_u64());
+    assert_eq!(body["Messages"][0]["Cc"][0]["Email"], "carol@example.com");
+    let alice = latest(&app, "alice@example.com").await;
+    assert_eq!(alice["provider_message_id"], body["Messages"][0]["To"][0]["MessageUUID"]);
+    assert_eq!(alice["subject"], "Hello Alice");
+    assert_eq!(alice["text"], "Code 123456");
+    assert_eq!(alice["from"]["name"], "Acme");
+    assert_eq!(alice["details"]["CustomID"], "signup-1");
+    assert_eq!(alice["attachments"][0]["filename"], "a.txt");
+    assert_eq!(latest(&app, "bob@example.com").await["subject"], "Hello there");
+
+    // An invalid message fails on its own: the valid one is still sent, and the answer is a 400.
+    let r = post_json(
+        &app,
+        "/v3.1/send",
+        &[MJ],
+        json!({ "Messages": [
+            { "From": { "Email": "app@acme.test" }, "To": [{ "Email": "ok@example.com" }], "TextPart": "x" },
+            { "From": { "Email": "app@acme.test" }, "To": [{ "Email": "not-an-address" }], "TextPart": "x" }
+        ] }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let body = r.json();
+    assert_eq!(body["Messages"][1]["Status"], "error");
+    assert_eq!(body["Messages"][1]["Errors"][0]["ErrorCode"], "mj-0013");
+    assert_eq!(body["Messages"][1]["Errors"][0]["ErrorRelatedTo"], json!(["To[0].Email"]));
+    assert_eq!(body["Messages"][0]["Status"], "success");
+    assert_eq!(get(&app, "/dev/api/messages?to=ok@example.com").await.json()["total"], 1);
+    assert!(
+        body["Messages"][0]["To"][0]["MessageHref"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://api.mailjet.com/v3/message/")
+    );
+
+    let r = post_json(
+        &app,
+        "/v3.1/send",
+        &[MJ],
+        json!({ "Messages": [{ "From": { "Email": "app@acme.test" }, "To": [{ "Email": "a@example.com" }] }] }),
+    )
+    .await;
+    assert_eq!(r.json()["Messages"][0]["Errors"][0]["ErrorCode"], "send-0003");
+
+    let r = post_json(&app, "/v3.1/send", &[], json!({ "Messages": [] })).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.text, "Not authorized");
+    let r = call(&app, Method::POST, "/v3.1/send", &[MJ], "{oops").await;
+    assert_eq!(r.json()["ErrorCode"], "mj-0002");
+}
+
+// ---------------------------------------------------------------------------
+// Brevo
+// ---------------------------------------------------------------------------
+
+const BV: (&str, &str) = ("api-key", "xkeysib-test");
+
+#[tokio::test]
+async fn brevo_send_and_message_versions() {
+    let (app, _) = app();
+    let r = post_json(
+        &app,
+        "/v3/smtp/email",
+        &[BV],
+        json!({
+            "sender": { "name": "Acme", "email": "app@acme.test" },
+            "to": [{ "email": "alice@example.com", "name": "Alice" }],
+            "replyTo": { "email": "help@acme.test" },
+            "subject": "Hi {{ params.name }}",
+            "htmlContent": "<p>Your code is {{ params.code }}</p>",
+            "params": { "name": "Alice", "code": "424242" },
+            "tags": ["otp"],
+            "headers": { "X-Campaign": "fall" },
+            "attachment": [{ "name": "a.txt", "content": b64_std("hi") }]
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text);
+    let id = r.json()["messageId"].as_str().unwrap().to_string();
+    assert!(id.ends_with("@smtp-relay.mailin.fr>"));
+    let m = latest(&app, "alice@example.com").await;
+    assert_eq!(m["provider_message_id"], id);
+    assert_eq!(m["subject"], "Hi Alice");
+    assert_eq!(m["html"], "<p>Your code is 424242</p>");
+    assert_eq!(m["reply_to"][0]["email"], "help@acme.test");
+    assert_eq!(m["tags"], json!(["otp"]));
+    assert_eq!(m["attachments"][0]["filename"], "a.txt");
+
+    let r = post_json(
+        &app,
+        "/v3/smtp/email",
+        &[BV],
+        json!({
+            "sender": { "email": "app@acme.test" },
+            "subject": "Hello {{ params.name }}",
+            "textContent": "Hi {{ params.name }}",
+            "messageVersions": [
+                { "to": [{ "email": "v1@example.com" }], "params": { "name": "One" } },
+                { "to": [{ "email": "v2@example.com" }], "params": { "name": "Two" }, "subject": "Custom for {{ params.name }}" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text);
+    assert_eq!(r.json()["messageIds"].as_array().unwrap().len(), 2);
+    assert_eq!(latest(&app, "v1@example.com").await["subject"], "Hello One");
+    assert_eq!(latest(&app, "v2@example.com").await["subject"], "Custom for Two");
+}
+
+#[tokio::test]
+async fn brevo_errors_look_like_brevos() {
+    let (app, _) = app();
+    let ok = json!({ "sender": { "email": "app@acme.test" }, "to": [{ "email": "a@example.com" }], "subject": "x", "textContent": "x" });
+    let r = post_json(&app, "/v3/smtp/email", &[], ok.clone()).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.json()["code"], "unauthorized");
+
+    let mut no_sender = ok.clone();
+    no_sender.as_object_mut().unwrap().remove("sender");
+    let r = post_json(&app, "/v3/smtp/email", &[BV], no_sender).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["code"], "missing_parameter");
+
+    let mut bad_to = ok.clone();
+    bad_to["to"] = json!([{ "email": "nope" }]);
+    assert_eq!(post_json(&app, "/v3/smtp/email", &[BV], bad_to).await.json()["code"], "invalid_parameter");
+}
+
+// ---------------------------------------------------------------------------
+// SparkPost
+// ---------------------------------------------------------------------------
+
+const SP: (&str, &str) = ("authorization", "sp-test-key");
+
+#[tokio::test]
+async fn sparkpost_transmissions() {
+    let (app, _) = app();
+    let r = post_json(
+        &app,
+        "/api/v1/transmissions",
+        &[SP],
+        json!({
+            "options": { "sandbox": true },
+            "campaign_id": "signup",
+            "substitution_data": { "product": "Acme" },
+            "recipients": [
+                { "address": { "email": "alice@example.com", "name": "Alice" }, "substitution_data": { "code": "777777" }, "tags": ["new"] },
+                { "address": "bob@example.com", "substitution_data": { "code": "888888" } },
+                { "address": { "email": "not-an-address" } }
+            ],
+            "content": {
+                "from": { "email": "app@acme.test", "name": "Acme" },
+                "subject": "{{product}} code",
+                "text": "Your code is {{code}}",
+                "inline_images": [{ "name": "logo", "type": "image/png", "data": b64_std([0x89, b'P', b'N', b'G']) }]
+            }
+        }),
+    )
+    .await;
+    // The invalid recipient makes it a 422, but the transmission was still created.
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text);
+    assert_eq!(r.json()["errors"][0]["code"], "2000");
+    let results = &r.json()["results"];
+    assert_eq!(results["total_accepted_recipients"], 2);
+    assert_eq!(results["total_rejected_recipients"], 1);
+    assert_eq!(results["rcpt_to_errors"][0]["description"], "Invalid email address: not-an-address");
+    let alice = latest(&app, "alice@example.com").await;
+    assert_eq!(alice["provider_message_id"], results["id"]);
+    assert_eq!(alice["subject"], "Acme code");
+    assert_eq!(alice["text"], "Your code is 777777");
+    assert_eq!(alice["tags"], json!(["new"]));
+    assert_eq!(alice["details"]["campaign_id"], "signup");
+    assert_eq!(alice["attachments"][0]["content_id"], "logo");
+    let bob = latest(&app, "bob@example.com").await;
+    assert_eq!(bob["text"], "Your code is 888888");
+    assert_eq!(bob["provider_message_id"], results["id"]);
+
+    let r = post_json(&app, "/api/v1/transmissions", &[], json!({})).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    let r = post_json(
+        &app,
+        "/api/v1/transmissions",
+        &[SP],
+        json!({ "content": { "from": "a@acme.test", "subject": "x", "text": "x" } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json()["errors"][0]["code"], "1400");
+}
+
+// ---------------------------------------------------------------------------
+// Mandrill
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mandrill_send_template_and_raw() {
+    let (app, _) = app();
+    let r = post_json(
+        &app,
+        "/api/1.0/messages/send.json",
+        &[],
+        json!({
+            "key": "md-test",
+            "message": {
+                "from_email": "app@acme.test", "from_name": "Acme",
+                "subject": "Hi *|NAME|*", "text": "Code *|code|*",
+                "to": [{ "email": "alice@example.com", "name": "Alice" }, { "email": "bob@example.com", "type": "cc" }, { "email": "broken" }],
+                "global_merge_vars": [{ "name": "name", "content": "friend" }],
+                "merge_vars": [{ "rcpt": "alice@example.com", "vars": [{ "name": "NAME", "content": "Alice" }, { "name": "code", "content": "121212" }] }],
+                "headers": { "Reply-To": "help@acme.test" },
+                "tags": ["otp"],
+                "metadata": { "user_id": "42" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let entries = r.json();
+    assert_eq!(entries.as_array().unwrap().len(), 3);
+    assert_eq!(entries[0]["status"], "sent");
+    assert_eq!(entries[0]["_id"].as_str().unwrap().len(), 32);
+    assert_eq!(
+        entries[2],
+        json!({ "email": "broken", "status": "invalid", "reject_reason": null, "queued_reason": null, "_id": entries[2]["_id"] })
+    );
+    // Without preserve_recipients, each recipient has a message of their own.
+    let alice = latest(&app, "alice@example.com").await;
+    assert_eq!(alice["subject"], "Hi Alice");
+    assert_eq!(alice["text"], "Code 121212");
+    assert_eq!(alice["cc"], json!([]));
+    assert_eq!(alice["reply_to"][0]["email"], "help@acme.test");
+    assert_eq!(alice["details"]["metadata"]["user_id"], "42");
+    let bob = latest(&app, "bob@example.com").await;
+    assert_eq!(bob["subject"], "Hi friend");
+    assert_eq!(bob["to"], json!([]));
+
+    let r = post_json(
+        &app,
+        "/api/1.0/messages/send-template",
+        &[],
+        json!({ "key": "md-test", "template_name": "welcome", "template_content": [], "message": { "to": [{ "email": "tpl@example.com" }], "global_merge_vars": [{ "name": "code", "content": "999" }] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let m = latest(&app, "tpl@example.com").await;
+    assert_eq!(m["template"]["id"], "welcome");
+    assert_eq!(m["template"]["data"]["merge_vars"]["code"], "999");
+
+    let r = post_json(
+        &app,
+        "/api/1.0/messages/send-raw",
+        &[],
+        json!({ "key": "md-test", "raw_message": "From: app@acme.test\r\nTo: raw@example.com\r\nSubject: Raw\r\n\r\nhi\r\n", "async": true }),
+    )
+    .await;
+    assert_eq!(r.json()[0]["status"], "queued");
+    assert_eq!(latest(&app, "raw@example.com").await["subject"], "Raw");
+
+    // Required parameters are checked before the key; both are 400 ValidationErrors.
+    let r = post_json(&app, "/api/1.3/messages/send", &[], json!({})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r.json(),
+        json!({ "status": "error", "code": -1, "name": "ValidationError", "message": "You must specify a message value" })
+    );
+    let r = post_json(&app, "/api/1.3/messages/send", &[], json!({ "message": {} })).await;
+    assert_eq!(r.json()["message"], "You must specify a key value");
+    let r = post_json(
+        &app,
+        "/api/1.3/messages/send",
+        &[],
+        json!({ "key": "k", "message": { "from_email": "a@acme.test" } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["code"], -2);
+    let r = post_json(
+        &app,
+        "/api/1.3/messages/send-template",
+        &[],
+        json!({ "key": "k", "template_name": "t", "message": {} }),
+    )
+    .await;
+    assert_eq!(r.json()["message"], "You must specify a template_content value");
+
+    // A rejected recipient is a per-recipient status, not an error.
+    let r = post_json(
+        &app,
+        "/api/1.0/messages/send",
+        &[],
+        json!({ "key": "k", "message": { "from_email": "a@acme.test", "text": "x", "to": [{ "email": "reject@localmail.test" }, { "email": "fine@example.com" }] } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()[0]["status"], "rejected");
+    assert_eq!(r.json()[1]["status"], "sent");
+}
+
+// ---------------------------------------------------------------------------
+// MailerSend
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mailersend_email_and_bulk() {
+    let (app, _) = app();
+    let r = post_json(
+        &app,
+        "/v1/email",
+        &[BEARER],
+        json!({
+            "from": { "email": "app@acme.test", "name": "Acme" },
+            "to": [{ "email": "alice@example.com", "name": "Alice" }, { "email": "bob@example.com" }],
+            "subject": "Hi {{ name }}",
+            "html": "<p>Code {{ code }}</p>",
+            "personalization": [
+                { "email": "alice@example.com", "data": { "name": "Alice", "code": "135790" } },
+                { "email": "bob@example.com", "data": { "name": "Bob", "code": "246802" } }
+            ],
+            "tags": ["otp"],
+            "headers": [{ "name": "X-Campaign", "value": "fall" }],
+            "attachments": [{ "content": b64_std("hi"), "filename": "a.txt", "disposition": "attachment" }]
+        }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    assert_eq!(r.header("x-message-id").len(), 24);
+    let alice = latest(&app, "alice@example.com").await;
+    assert_eq!(alice["subject"], "Hi Alice");
+    assert_eq!(alice["html"], "<p>Code 135790</p>");
+    assert_eq!(alice["tags"], json!(["otp"]));
+    assert_eq!(alice["attachments"][0]["filename"], "a.txt");
+    assert_eq!(latest(&app, "bob@example.com").await["subject"], "Hi Bob");
+
+    let email = |to: &str| json!({ "from": { "email": "app@acme.test" }, "to": [{ "email": to }], "subject": "Bulk", "text": "x" });
+    let r =
+        post_json(&app, "/v1/bulk-email", &[BEARER], json!([email("b1@example.com"), json!({ "subject": "no from" })]))
+            .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    assert_eq!(r.json()["message"], "The bulk email is being processed.");
+    assert_eq!(latest(&app, "b1@example.com").await["subject"], "Bulk");
+
+    let r = post_json(&app, "/v1/email", &[], email("a@example.com")).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.json(), json!({ "message": "Unauthenticated." }));
+    let r = post_json(
+        &app,
+        "/v1/email",
+        &[BEARER],
+        json!({ "from": { "email": "app@acme.test" }, "subject": "x", "text": "x" }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        r.json(),
+        json!({ "message": "The given data was invalid.", "errors": { "to": ["The to field is required."] } })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OAuth token endpoints
+// ---------------------------------------------------------------------------
+
+const FORM: (&str, &str) = ("content-type", "application/x-www-form-urlencoded");
+
+/// An unsigned JWT with these claims (the token endpoints don't check signatures).
+fn jwt(claims: Value) -> String {
+    format!("{}.{}.sig", b64url(r#"{"alg":"RS256","typ":"JWT"}"#), b64url(&claims.to_string()))
+}
+
+#[tokio::test]
+async fn google_token_grants_and_errors() {
+    let (app, _) = app();
+    let r = call(
+        &app,
+        Method::POST,
+        "/token",
+        &[FORM],
+        form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", "cid.apps.googleusercontent.com"),
+            ("client_secret", "s3cret"),
+            ("refresh_token", "1//abc"),
+        ]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let body = r.json();
+    assert!(body["access_token"].as_str().unwrap().starts_with("ya29."));
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["expires_in"], 3599);
+    assert_eq!(r.header("cache-control"), "no-store");
+    // The attempt is logged without its secrets.
+    let attempt = &attempts(&app).await[0];
+    assert_eq!(attempt["provider"], "gmail");
+    assert_eq!(attempt["endpoint"], "POST /token (refresh_token)");
+    let logged = attempt["request"].as_str().unwrap();
+    assert!(
+        logged.contains("cid.apps.googleusercontent.com") && !logged.contains("s3cret") && !logged.contains("1//abc")
+    );
+
+    // A service account acting as a user: the token knows the mailbox, so `users/me` sends
+    // without a From are from that user, as with Gmail.
+    let assertion = jwt(
+        json!({ "iss": "sa@proj.iam.gserviceaccount.com", "sub": "ann@acme.test", "scope": "https://www.googleapis.com/auth/gmail.send", "aud": "https://oauth2.googleapis.com/token" }),
+    );
+    let r = call(
+        &app,
+        Method::POST,
+        "/token",
+        &[FORM],
+        form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &assertion)]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let token = format!("Bearer {}", r.json()["access_token"].as_str().unwrap());
+    let r = post_json(
+        &app,
+        "/gmail/v1/users/me/messages/send",
+        &[("authorization", &token)],
+        json!({ "raw": b64url("To: bob@example.com\r\nSubject: From Ann\r\n\r\nhi") }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert_eq!(latest(&app, "bob@example.com").await["from"]["email"], "ann@acme.test");
+
+    let google = |pairs: &[(&str, &str)]| call(&app, Method::POST, "/token", &[FORM], form(pairs));
+    let r = google(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", "c"),
+        ("client_secret", "s"),
+        ("refresh_token", "revoked"),
+    ])
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r.json(),
+        json!({ "error": "invalid_grant", "error_description": "Token has been expired or revoked." })
+    );
+    let r = google(&[("grant_type", "refresh_token"), ("refresh_token", "x")]).await;
+    assert_eq!(r.json()["error_description"], "Could not determine client ID from request.");
+    let r = google(&[("grant_type", "refresh_token"), ("client_id", "c")]).await;
+    assert_eq!(r.json()["error_description"], "client_secret is missing.");
+    let r = google(&[("grant_type", "refresh_token"), ("client_id", "c"), ("client_secret", "s")]).await;
+    assert_eq!(r.json()["error_description"], "Missing required parameter: refresh_token");
+    let r = google(&[]).await;
+    assert_eq!(r.json(), json!({ "error": "unsupported_grant_type", "error_description": "Invalid grant_type: " }));
+    let r = google(&[("grant_type", "client_credentials"), ("client_id", "c")]).await;
+    assert_eq!(r.json()["error"], "unsupported_grant_type");
+    let r = google(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", "c"),
+        ("client_secret", "invalid"),
+        ("refresh_token", "x"),
+    ])
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        r.json(),
+        json!({ "error": "invalid_client", "error_description": "The provided client secret is invalid." })
+    );
+    assert_eq!(attempts(&app).await[0]["outcome"], "failed");
+}
+
+#[tokio::test]
+async fn microsoft_token_grants_and_errors() {
+    let (app, _) = app();
+    let path = "/contoso.onmicrosoft.com/oauth2/v2.0/token";
+    let ms = |pairs: Vec<(&'static str, &'static str)>| {
+        let app = app.clone();
+        async move { call(&app, Method::POST, path, &[FORM], form(&pairs)).await }
+    };
+    let r = ms(vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", "app-1"),
+        ("client_secret", "s"),
+        ("scope", "https://graph.microsoft.com/.default"),
+    ])
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let body = r.json();
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["ext_expires_in"], 3599);
+    assert_eq!(body["access_token"].as_str().unwrap().split('.').count(), 3);
+    assert!(body.get("refresh_token").is_none());
+    assert_eq!(attempts(&app).await[0]["provider"], "graph");
+
+    // A user's token: `/me` sends are from them.
+    let r = ms(vec![
+        ("grant_type", "password"),
+        ("client_id", "app-1"),
+        ("username", "ann@contoso.test"),
+        ("password", "pw"),
+        ("scope", "Mail.Send offline_access"),
+    ])
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert!(r.json()["refresh_token"].is_string());
+    let token = format!("Bearer {}", r.json()["access_token"].as_str().unwrap());
+    let send = json!({ "message": { "subject": "Hi", "body": { "contentType": "Text", "content": "x" }, "toRecipients": [{ "emailAddress": { "address": "bob@example.com" } }] } });
+    let r = post_json(&app, "/v1.0/me/sendMail", &[("authorization", &token)], send).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+    assert_eq!(latest(&app, "bob@example.com").await["from"]["email"], "ann@contoso.test");
+
+    let r = ms(vec![("client_id", "app-1")]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let body = r.json();
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_codes"], json!([900144]));
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap()
+            .starts_with("AADSTS900144: The request body must contain the following parameter: 'grant_type'.")
+    );
+    let r = ms(vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", "app-1"),
+        ("client_secret", "s"),
+        ("scope", "Mail.Send"),
+    ])
+    .await;
+    assert_eq!(r.json()["error"], "invalid_scope");
+    let r = ms(vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", "app-1"),
+        ("scope", "https://graph.microsoft.com/.default"),
+    ])
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.json()["error_codes"], json!([7000216]));
+    let r = ms(vec![("grant_type", "client_credentials"), ("client_id", "app-1"), ("client_secret", "s")]).await;
+    assert_eq!(r.json()["error_codes"], json!([90014]));
+    let r = ms(vec![("grant_type", "nope"), ("client_id", "app-1")]).await;
+    assert_eq!(r.json()["error"], "unsupported_grant_type");
+    assert!(r.json().get("error_uri").is_none());
+
+    // MSAL's delegated flows get client_info, and an ID token with `openid`.
+    let r = ms(vec![
+        ("grant_type", "authorization_code"),
+        ("client_id", "app-1"),
+        ("code", "c"),
+        ("redirect_uri", "http://localhost/cb"),
+        ("scope", "openid Mail.Send"),
+    ])
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    assert!(r.json()["client_info"].is_string());
+    assert_eq!(r.json()["id_token"].as_str().unwrap().split('.').count(), 3);
+    // MSAL adds ?client-request-id=…
+    let r = call(
+        &app,
+        Method::POST,
+        &format!("{path}?client-request-id=abc"),
+        &[FORM],
+        form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", "a"),
+            ("client_secret", "s"),
+            ("scope", "https://graph.microsoft.com/.default"),
+        ]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let r = get(&app, "/contoso.onmicrosoft.com/v2.0/.well-known/openid-configuration").await;
+    assert_eq!(
+        r.json()["token_endpoint"],
+        "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token"
+    );
+    let r = ms(vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", "app-1"),
+        ("refresh_token", "revoked"),
+        ("scope", "Mail.Send"),
+    ])
+    .await;
+    assert_eq!(r.json()["error"], "invalid_grant");
+    assert_eq!(r.json()["error_codes"], json!([70008]));
+}

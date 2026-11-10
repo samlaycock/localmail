@@ -57,6 +57,10 @@ pub fn random_from(alphabet: &[u8], len: usize) -> String {
     (0..len).map(|_| alphabet[rng.gen_range(0..alphabet.len())] as char).collect()
 }
 
+pub fn random_digits(len: usize) -> String {
+    random_from(b"0123456789", len)
+}
+
 pub fn b64_std(data: impl AsRef<[u8]>) -> String {
     STANDARD.encode(data)
 }

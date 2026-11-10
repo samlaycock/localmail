@@ -2,10 +2,19 @@
 //! Each adapter reads its provider's request into [`Draft`]s (or the provider's validation error),
 //! hands them to [`crate::send::submit`], and answers in its provider's format.
 
+pub mod brevo;
+pub mod gmail;
+pub mod graph;
+pub mod mailersend;
+pub mod mailgun;
+pub mod mailjet;
+pub mod mandrill;
 pub mod postmark;
 pub mod resend;
 pub mod sendgrid;
 pub mod ses;
+pub mod sparkpost;
+pub mod tokens;
 
 use axum::http::HeaderMap;
 use axum::{Router, middleware};
@@ -20,6 +29,15 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .merge(postmark::routes())
         .merge(resend::routes())
         .merge(ses::routes())
+        .merge(gmail::routes())
+        .merge(graph::routes())
+        .merge(mailgun::routes())
+        .merge(mailjet::routes())
+        .merge(brevo::routes())
+        .merge(sparkpost::routes())
+        .merge(mandrill::routes())
+        .merge(mailersend::routes())
+        .merge(tokens::routes())
         // Bodies are read (up to the limit) by the attempts recorder.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(state, crate::attempts::record))
@@ -30,6 +48,18 @@ pub fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.trim().split_once(' ')?;
     (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
+}
+
+/// The user and password of `Authorization: Basic …` (Mailgun, Mailjet), if there's a user.
+pub fn basic(headers: &HeaderMap) -> Option<(String, String)> {
+    let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, encoded) = value.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = String::from_utf8(crate::util::b64_decode_lenient(encoded.trim())?).ok()?;
+    let (user, pass) = decoded.split_once(':')?;
+    (!user.is_empty()).then(|| (user.to_string(), pass.to_string()))
 }
 
 pub fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -95,6 +125,13 @@ pub fn keep(draft: &mut Draft, from: &Value, keys: &[&str]) {
             draft.details.insert((*k).to_string(), v.clone());
         }
     }
+}
+
+/// Apply a template substitution to a draft's subject and bodies.
+pub fn fill(d: &mut Draft, f: impl Fn(&str) -> String) {
+    d.subject = f(&d.subject);
+    d.text = d.text.as_deref().map(&f);
+    d.html = d.html.as_deref().map(&f);
 }
 
 /// Merge two JSON objects (the second wins).
