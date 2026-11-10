@@ -1,6 +1,6 @@
 [package]
 name = "localmail"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A local SMTP server and email API emulator (SES, SendGrid, Postmark, Resend, Gmail, Microsoft Graph, Mailgun, Mailjet, Brevo, SparkPost, Mandrill, MailerSend) for offline development and testing"
 license = "MIT OR Apache-2.0"
