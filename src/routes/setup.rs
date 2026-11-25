@@ -1,87 +1,33 @@
+//! What the web UI shows about this server, as JSON: `GET /dev/api/info` (the version, addresses
+//! and providers, for every page) and `GET /dev/api/setup` (the endpoints and SDK snippets for
+//! this server's addresses, for the setup page).
+
+use axum::Json;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::html::{data_script, esc, page};
 use crate::message::Provider;
 use crate::state::AppState;
 
-// The assets are compiled in and can change with every upgrade, so browsers must not reuse a
-// stale copy against newer HTML. They're small and served locally, so always revalidating is cheap.
-pub async fn css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
-        include_str!("../../assets/app.css"),
-    )
+fn no_store() -> [(header::HeaderName, &'static str); 1] {
+    [(header::CACHE_CONTROL, "no-store")]
 }
 
-pub async fn js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
-        include_str!("../../assets/app.js"),
-    )
-}
-
-fn providers_json() -> serde_json::Value {
-    Provider::ALL.iter().map(|p| json!({ "id": p.id(), "name": p.name(), "color": p.color() })).collect()
-}
-
-pub async fn inbox(State(state): State<AppState>) -> Response {
-    let data = json!({ "providers": providers_json(), "smtp": smtp_address(&state), "base": state.config.base_url });
-    let body = format!(
-        r#"<div class="inbox" id="lm-inbox">
-  <nav class="mailbox-pane" aria-label="Mailboxes">
-    <div class="mailbox-title">Mailboxes</div>
-    <input id="lm-mbox-filter" type="search" placeholder="Filter addresses" aria-label="Filter mailboxes">
-    <ul class="mailboxes" id="lm-mailboxes"></ul>
-  </nav>
-  <section class="list-pane">
-    <div class="mailbox-head" id="lm-mailbox-head" hidden></div>
-    <div class="list-toolbar">
-      <input id="lm-search" type="search" placeholder="Search" aria-label="Search messages">
-      <select id="lm-provider" aria-label="Filter by provider"><option value="">All</option></select>
-    </div>
-    <div class="list-actions">
-      <span id="lm-count" class="muted small"></span>
-      <span class="spacer"></span>
-      <button class="btn small ghost" id="lm-read-all" type="button">Mark all read</button>
-      <button class="btn small ghost danger" id="lm-delete-all" type="button">Delete all</button>
-    </div>
-    <ol class="messages" id="lm-messages" aria-label="Messages"></ol>
-  </section>
-  <section class="view-pane" id="lm-view" aria-live="polite"></section>
-</div>
-{}"#,
-        data_script(&data)
-    );
-    page("Inbox", "inbox", &body).into_response()
-}
-
-pub async fn attempts() -> Response {
-    let body = format!(
-        r#"<section class="card">
-  <div class="eyebrow">Attempts</div>
-  <h1>Every send, accepted or not</h1>
-  <p class="muted">The last {capacity} sends over SMTP and the provider APIs, newest first, including the ones that failed validation or hit a scenario address. Click one to see the request and the response. Tests can read the same list from <code>GET /dev/api/attempts</code>.</p>
-  <div class="req-toolbar">
-    <select id="att-provider" aria-label="Filter by provider"><option value="">All providers</option>{options}</select>
-    <label class="check"><input type="checkbox" id="att-errors"> Failures only</label>
-    <span class="req-spacer"></span>
-    <button class="btn small" id="att-pause" type="button">Pause</button>
-    <button class="btn small ghost" id="att-clear" type="button">Clear</button>
-  </div>
-  <div id="lm-attempts"></div>
-</section>
-{data}"#,
-        capacity = crate::attempts::CAPACITY,
-        options = Provider::ALL
-            .iter()
-            .map(|p| format!(r#"<option value="{}">{}</option>"#, p.id(), esc(p.name())))
-            .collect::<String>(),
-        data = data_script(&json!({ "providers": providers_json() })),
-    );
-    page("Attempts", "attempts", &body).into_response()
+pub async fn info(State(state): State<AppState>) -> Response {
+    let providers: Vec<Value> =
+        Provider::ALL.iter().map(|p| json!({ "id": p.id(), "name": p.name(), "color": p.color() })).collect();
+    let body = json!({
+        "name": "localmail",
+        "version": env!("CARGO_PKG_VERSION"),
+        "base_url": state.config.base_url,
+        "smtp": smtp_address(&state),
+        "scenario_domain": state.config.scenario_domain,
+        "attempts_capacity": crate::attempts::CAPACITY,
+        "providers": providers,
+    });
+    (no_store(), Json(body)).into_response()
 }
 
 fn smtp_address(state: &AppState) -> String {
@@ -92,12 +38,8 @@ fn smtp_address(state: &AppState) -> String {
     format!("{host}:{}", state.config.smtp_port)
 }
 
-fn snippet(title: &str, code: &str) -> String {
-    format!(
-        r#"<div class="snippet"><div class="token-head"><b>{}</b><button type="button" class="btn small" data-copy-next>Copy</button></div><pre class="code">{}</pre></div>"#,
-        esc(title),
-        esc(code)
-    )
+fn snippet(title: &str, code: &str) -> Value {
+    json!({ "title": title, "code": code })
 }
 
 pub async fn setup(State(state): State<AppState>) -> Response {
@@ -107,7 +49,7 @@ pub async fn setup(State(state): State<AppState>) -> Response {
     let host_port = base.trim_start_matches("http://").trim_start_matches("https://");
     let domain = &state.config.scenario_domain;
 
-    let endpoints: String = [
+    let endpoints: Vec<Value> = [
         ("SMTP (any AUTH PLAIN/LOGIN credentials, no TLS)", smtp.clone()),
         ("Amazon SES v2: SendEmail", format!("POST {base}/v2/email/outbound-emails")),
         ("Amazon SES v1: SendEmail, SendRawEmail, SendTemplatedEmail", format!("POST {base}/ (Action=…)")),
@@ -142,25 +84,17 @@ pub async fn setup(State(state): State<AppState>) -> Response {
         ("Dev API (messages, wait, attempts, scenarios)", format!("{base}/dev/api/…")),
     ]
     .iter()
-    .map(|(label, url)| format!("<tr><td>{}</td><td><code>{}</code></td></tr>", esc(label), esc(url)))
+    .map(|(label, url)| json!({ "label": label, "url": url }))
     .collect();
 
-    let scenarios: String = crate::scenarios::docs(domain)
-        .iter()
-        .map(|d| format!("<tr><td><code>{}</code></td><td>{}</td></tr>", esc(&d.address), esc(d.effect)))
-        .collect();
-
-    let snippets = [
+    let snippets = vec![
         snippet(
             "SMTP: Nodemailer",
             &format!(
                 "nodemailer.createTransport({{ host: '{smtp_host}', port: {smtp_port}, secure: false, ignoreTLS: true }})"
             ),
         ),
-        snippet(
-            "SMTP: Python",
-            &format!("import smtplib\nsmtplib.SMTP('{smtp_host}', {smtp_port}).send_message(msg)"),
-        ),
+        snippet("SMTP: Python", &format!("import smtplib\nsmtplib.SMTP('{smtp_host}', {smtp_port}).send_message(msg)")),
         snippet(
             "Amazon SES: any AWS SDK (environment)",
             &format!(
@@ -234,17 +168,24 @@ pub async fn setup(State(state): State<AppState>) -> Response {
                 "Mailjet.Request.protocol = 'http://';  // https is otherwise hard-coded\nMailjet.apiConnect('key', 'secret', {{ config: {{ host: '{host_port}' }} }})"
             ),
         ),
-        snippet("Mailjet: mailjet_rest (Python)", &format!("Client(auth=('key', 'secret'), version='v3.1', api_url='{base}/')")),
+        snippet(
+            "Mailjet: mailjet_rest (Python)",
+            &format!("Client(auth=('key', 'secret'), version='v3.1', api_url='{base}/')"),
+        ),
         snippet("Brevo: @getbrevo/brevo", &format!("new BrevoClient({{ apiKey: 'test', baseUrl: '{base}/v3' }})")),
         snippet("Brevo: brevo-python", &format!("Brevo(api_key='test', base_url='{base}/v3')")),
         snippet("SparkPost: sparkpost (Node)", &format!("new SparkPost('test', {{ origin: '{base}' }})")),
         snippet(
             "SparkPost: python-sparkpost",
-            &format!("sp = SparkPost('test')\nsp.transmissions.base_uri = '{base}/api/v1'  # base_uri otherwise forces https"),
+            &format!(
+                "sp = SparkPost('test')\nsp.transmissions.base_uri = '{base}/api/v1'  # base_uri otherwise forces https"
+            ),
         ),
         snippet(
             "Mandrill: @mailchimp/mailchimp_transactional",
-            &format!("const client = require('@mailchimp/mailchimp_transactional')('test');\nclient.basePath = '{base}/api/1.3';"),
+            &format!(
+                "const client = require('@mailchimp/mailchimp_transactional')('test');\nclient.basePath = '{base}/api/1.3';"
+            ),
         ),
         snippet(
             "Mandrill: mailchimp-transactional (Python)",
@@ -252,7 +193,9 @@ pub async fn setup(State(state): State<AppState>) -> Response {
         ),
         snippet(
             "MailerSend: mailersend (Node)",
-            &format!("const ms = new MailerSend({{ apiKey: 'test' }});\nms.email.baseUrl = '{base}/v1';  // there's no option for it"),
+            &format!(
+                "const ms = new MailerSend({{ apiKey: 'test' }});\nms.email.baseUrl = '{base}/v1';  // there's no option for it"
+            ),
         ),
         snippet("MailerSend: mailersend (Python)", &format!("MailerSendClient(api_key='test', base_url='{base}/v1')")),
         snippet(
@@ -273,41 +216,20 @@ pub async fn setup(State(state): State<AppState>) -> Response {
                 "new ConfidentialClientApplication({{ auth: {{ clientId, clientSecret,\n  authority: 'https://login.microsoftonline.com/<tenant>',  // MSAL needs https here\n  authorityMetadata: JSON.stringify({{\n    token_endpoint: '{base}/<tenant>/oauth2/v2.0/token',\n    authorization_endpoint: '{base}/<tenant>/oauth2/v2.0/authorize',\n    issuer: 'https://login.microsoftonline.com/<tenant>/v2.0',\n    jwks_uri: 'https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys' }}) }} }})"
             ),
         ),
-    ]
-    .concat();
+    ];
 
-    let body = format!(
-        r#"<section class="card hero">
-  <div class="eyebrow">Local email for development</div>
-  <h1>Send to <span class="accent">{smtp}</span> or the provider APIs at <span class="accent">{base}</span></h1>
-  <p class="muted">localmail keeps every message instead of delivering it. Point an SMTP client or your email provider's SDK at it, and read what was sent in the <a href="/">inbox</a> or through the dev API. Any credentials are accepted, but the APIs still expect the kind their provider uses (a bearer token, a server token, a SigV4 signature).</p>
-</section>
-<section class="card">
-  <h2>Endpoints</h2>
-  <table class="endpoints">{endpoints}</table>
-</section>
-<section class="card">
-  <h2>Pointing an SDK at localmail</h2>
-  <div class="snippets">{snippets}</div>
-</section>
-<section class="card">
-  <h2>Scenario addresses</h2>
-  <p class="muted">Send to one of these to make the send itself fail (or slow down) the way the provider would. A <code>+suffix</code> is ignored, e.g. <code>ratelimit+signup@{domain}</code>. Flaky counters can be reset with <code>POST /dev/api/scenarios/reset</code>.</p>
-  <table class="endpoints">{scenarios}</table>
-</section>
-<section class="card">
-  <h2>Test automation</h2>
-  {test}
-</section>"#,
-        smtp = esc(&smtp),
-        base = esc(base),
-        domain = esc(domain),
-        test = snippet(
+    let body = json!({
+        "base_url": base,
+        "smtp": smtp,
+        "scenario_domain": domain,
+        "endpoints": endpoints,
+        "snippets": snippets,
+        "test": snippet(
             "Wait for an email and read its code",
             &format!(
                 "cursor=$(curl -s {base}/dev/api/cursor | jq .cursor)\n# ... trigger the email ...\ncurl -s \"{base}/dev/api/messages/wait?to=alice@example.com&after=$cursor&timeout=30s&extract=otp,links\" \\\n  | jq '.extracted'"
             )
         ),
-    );
-    page("Setup", "setup", &body).into_response()
+    });
+    (no_store(), Json(body)).into_response()
 }

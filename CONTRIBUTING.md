@@ -4,7 +4,7 @@ Thanks for helping out. Bug reports, provider fixes (a provider whose real API a
 
 ## Development
 
-You need a recent stable Rust toolchain. Node.js is needed for changesets.
+You need a recent stable Rust toolchain. The web UI also needs Node.js (22.22+, 24.11+ or 26+) and [Bun](https://bun.com), its package manager. Node.js is needed for changesets too.
 
 ```sh
 cargo run                        # HTTP on http://localhost:9402, SMTP on localhost:2525
@@ -16,9 +16,9 @@ docker build -t localmail .      # the release image
 scripts/docker-smoke.sh localmail
 ```
 
-CI runs `cargo fmt --check`, clippy with `-D warnings`, `cargo test` and `cargo audit` on every pull request.
+CI runs `cargo fmt --check`, clippy with `-D warnings`, `cargo test` and `cargo audit` on every pull request, and lints and builds the web UI.
 
-- The pages share `assets/app.js` and `assets/app.css`. Both are compiled into the binary, so rebuild after changing them.
+- The web UI is a React app in `ui/`, built with stock shadcn/ui components. Its build output, `ui/dist`, is committed and compiled into the binary, so run `bun run check` and `bun run build` in `ui/` and commit `ui/dist` with any change to it. [`ui/README.md`](ui/README.md) covers working on it and its conventions.
 - Each provider API is one file in `src/providers/`. It reads its provider's request into `Draft`s, or into the provider's validation error. It then hands them to `send::submit`, which applies scenario addresses and stores the messages, and answers in its provider's format. Error bodies and messages should match what the real API returns. Cite the provider's documentation in the pull request.
 - SMTP is `src/smtp.rs`, scenario addresses are in `src/scenarios.rs`, and code and link extraction is in `src/extract.rs`.
 - Messages are kept as MIME (`src/message.rs` builds it for API sends) in SQLite (`src/store.rs`).

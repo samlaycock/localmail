@@ -1,5 +1,6 @@
 pub mod api;
-pub mod pages;
+pub mod setup;
+pub mod ui;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -10,12 +11,16 @@ use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(pages::inbox))
-        .route("/attempts", get(pages::attempts))
-        .route("/setup", get(pages::setup))
-        .route("/assets/app.css", get(pages::css))
-        .route("/assets/app.js", get(pages::js))
+        // The web UI's pages. The app routes in the browser.
+        .route("/", get(ui::index))
+        .route("/messages/{id}", get(ui::index))
+        .route("/attempts", get(ui::index))
+        .route("/setup", get(ui::index))
+        .route("/assets/{*path}", get(ui::asset))
+        .route("/favicon.svg", get(ui::favicon))
         .route("/health", get(|| async { "ok" }))
+        .route("/dev/api/info", get(setup::info))
+        .route("/dev/api/setup", get(setup::setup))
         .route("/dev/api/cursor", get(api::cursor))
         .route("/dev/api/mailboxes", get(api::mailboxes))
         .route("/dev/api/messages", get(api::list).delete(api::delete_matching))

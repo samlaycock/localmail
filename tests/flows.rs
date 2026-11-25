@@ -724,10 +724,40 @@ async fn html_is_sandboxed_with_inline_images() {
 #[tokio::test]
 async fn pages_render() {
     let (app, _) = app();
-    for page in ["/", "/attempts", "/setup", "/assets/app.css", "/assets/app.js", "/health"] {
-        assert_eq!(get(&app, page).await.status, StatusCode::OK, "{page}");
+    // Every page serves the app, which routes in the browser.
+    for page in ["/", "/messages/1", "/attempts", "/setup"] {
+        let r = get(&app, page).await;
+        assert_eq!(r.status, StatusCode::OK, "{page}");
+        assert!(r.text.contains(r#"<div id="root"></div>"#), "{page}: {}", r.text);
     }
-    assert!(get(&app, "/setup").await.text.contains("AWS_ENDPOINT_URL_SESV2"));
+    // So do the script, stylesheet and fonts it loads.
+    let index = get(&app, "/").await.text;
+    let assets: Vec<&str> = index.split('"').filter(|s| s.starts_with("/assets/")).collect();
+    assert!(assets.iter().any(|a| a.ends_with(".js")) && assets.iter().any(|a| a.ends_with(".css")), "{index}");
+    for asset in assets {
+        let r = get(&app, asset).await;
+        assert_eq!(r.status, StatusCode::OK, "{asset}");
+        assert!(r.header("cache-control").contains("immutable"), "{asset}");
+    }
+    for path in ["/favicon.svg", "/health"] {
+        assert_eq!(get(&app, path).await.status, StatusCode::OK, "{path}");
+    }
+    assert_eq!(get(&app, "/assets/missing.js").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(get(&app, "/assets/../index.html").await.status, StatusCode::NOT_FOUND);
+
+    // What the pages read beyond the dev API.
+    let info = get(&app, "/dev/api/info").await.json();
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    assert!(info["providers"].as_array().unwrap().iter().any(|p| p["id"] == "sendgrid"), "{info}");
+    let setup = get(&app, "/dev/api/setup").await.json();
+    assert!(
+        setup["snippets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["code"].as_str().unwrap().contains("AWS_ENDPOINT_URL_SESV2"))
+    );
+    assert!(setup["endpoints"].as_array().unwrap().len() > 10, "{setup}");
 }
 
 #[tokio::test]
