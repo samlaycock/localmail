@@ -10,7 +10,7 @@
     "check": "vp check",
     "fix": "vp check --fix",
     "preview": "vp preview",
-    "stock-diff": "shadcn add $(cd src/components/ui && ls | sed 's/\\.tsx$//') --diff"
+    "stock-diff": "for c in $(ls src/components/ui | sed 's/[.]tsx$//'); do out=$(shadcn add $c --diff 2>&1); case \"$out\" in *'No changes'*) ;; *overwrite*) echo \"$c differs from the registry (shadcn add $c --diff shows how)\" ;; *) echo \"$c could not be checked: $out\" ;; esac; done; echo \"Compared $(ls src/components/ui | wc -l | tr -d ' ') components with the registry.\""
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
