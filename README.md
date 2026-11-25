@@ -247,6 +247,7 @@ Codes and links are searched in the subject, the text body, the HTML and, for [t
 | `POST /dev/api/messages/{id}/read`, `POST /dev/api/messages/read` | Mark one, or every matching message (all of them without filters), as read. Send the body `{"read": false}` to mark them unread. |
 | `GET`, `DELETE /dev/api/attempts` | The [attempts log](#attempts) |
 | `GET /dev/api/scenarios`, `POST /dev/api/scenarios/reset` | Scenario addresses, flaky counters |
+| `GET /dev/api/info`, `GET /dev/api/setup` | The version, addresses and providers, and the endpoints and SDK snippets for this server, as the web UI shows them |
 
 **Isolating tests.** Give each test its own recipient, e.g. `alice-<uuid>@example.com`, and filter on it. Parallel workers then never see each other's mail, and nothing needs clearing between tests. `DELETE /dev/api/messages?to=…` tidies up one test's messages, and printing `http://localhost:9402/?to=<address>` when a test fails links straight to its [mailbox](#the-inbox).
 
