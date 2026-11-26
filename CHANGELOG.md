@@ -1,5 +1,16 @@
 # localmail
 
+## 0.4.0
+
+### Minor Changes
+
+- [#6](https://github.com/samlaycock/localmail/pull/6) [`e5fca5d`](https://github.com/samlaycock/localmail/commit/e5fca5d4f52f82ab30084f3d1d641ccacca266ab) Thanks [@samlaycock](https://github.com/samlaycock)! - The web UI is rebuilt as a React app with shadcn/ui components. It works as before, with a few changes:
+  
+  - Each message has its own link, `/messages/<id>`. Old `/#/m/<id>` links still open the message.
+  - The search and provider filter are kept in the URL, so a filtered view can be shared or bookmarked.
+  - The three inbox panes can be resized, and there's a light, dark and system theme switch.
+  - `GET /dev/api/info` and `GET /dev/api/setup` return what the pages show about the server.
+
 ## 0.3.0
 
 ### Minor Changes
